@@ -1,23 +1,21 @@
-"""Entry point: Flask + diskcache. Без SQLite."""
+"""Entry point: Flask + diskcache + metrics.analyze."""
 from __future__ import annotations
 
 import json
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import diskcache
 from flask import Flask, jsonify, render_template, request, Response
 
-from datetime import timedelta
-from metrics import build_impacts, pick_recommendation
-from timelines import build_windows_timelines, iso_z, parse_dt
+from metrics import analyze as metrics_analyze, ALGO_VERSION
+from timelines import iso_z, parse_dt
 
 import sources
 
 
-ALGO_VERSION = "0.2.0"
-CALC_TTL = 7 * 24 * 3600  # хранить расчёты неделю
+CALC_TTL = 7 * 24 * 3600
 
 
 def create_app() -> Flask:
@@ -30,10 +28,8 @@ def create_app() -> Flask:
     os.makedirs(app.config["CACHE_DIR"], exist_ok=True)
     os.makedirs(app.config["CALC_DIR"], exist_ok=True)
 
-    # единый путь для requests_cache
-    sources.CACHE_DIR = type(sources.CACHE_DIR)(app.config["CACHE_DIR"])
+    sources.configure(app.config["CACHE_DIR"])
 
-    # storage для расчётов
     app.calcs = diskcache.Cache(app.config["CALC_DIR"])
 
     register_routes(app)
@@ -51,6 +47,10 @@ def _now() -> datetime:
 def register_routes(app: Flask) -> None:
 
     # --- pages ---
+
+    @app.get("/result/<calc_id>")
+    def result_page(calc_id: str):
+        return render_template("result.html", calc_id=calc_id)
 
     @app.get("/")
     def index():
@@ -71,10 +71,12 @@ def register_routes(app: Flask) -> None:
         })
 
     # --- analyze ---
+
     @app.post("/api/analyze")
-    def analyze():
+    def analyze_endpoint():
         body = request.get_json(silent=True) or {}
         mode = (body.get("mode") or "current").lower()
+
         try:
             start = parse_dt(body.get("start")) if body.get("start") else _now()
             duration_h = max(1, min(8, int(float(body.get("duration", 6)))))
@@ -85,58 +87,35 @@ def register_routes(app: Flask) -> None:
         cutoff = _now() if mode == "historical" else None
         end = start + timedelta(hours=search_h)
 
+        # Наличие Space-Track — отключаем CDM, если creds не заданы
+        has_st = bool(
+            os.getenv("SPACETRACK_USER")
+            or os.getenv("SPACETRACK_IDENTITY")
+        ) and bool(os.getenv("SPACETRACK_PASSWORD"))
+
         data = sources.collect_for_window(
             start, end,
             cutoff=cutoff,
             include_historical_tle=(mode == "historical"),
-            include_cdm=True,
+            include_cdm=has_st,
             include_sep=True,
-            include_meteors=True,
+            include_swpc=(mode == "current"),
+            include_donki=True,
+            include_gfz=True,
+            include_rsga=True,
+            include_socrates=(mode == "current"),
         )
 
-        impacts = build_impacts(data, start, end)
-
-        # окна-кандидаты
-        windows = []
-        idx = 0
-        w = start
-        last_start = start + timedelta(hours=search_h - duration_h)
-        while w <= last_start:
-            idx += 1
-            windows.append({
-                "id": idx,
-                "start": iso_z(w),
-                "end": iso_z(w + timedelta(hours=duration_h)),
-                "duration_minutes": duration_h * 60,
-            })
-            w += timedelta(minutes=30)
-        if len(windows) > 8:
-            stride = len(windows) // 8
-            windows = windows[::stride][:8]
-
-        built = build_windows_timelines(windows, [i.to_dict() for i in impacts])
-        recommendation = pick_recommendation(built)
-
-        result = {
-            "calculation_id": uuid.uuid4().hex[:12],
-            "created_at": _iso_z(_now()),
-            "algorithm_version": ALGO_VERSION,
-            "mode": mode,
-            "start": iso_z(start),
-            "duration_hours": duration_h,
-            "windows": built,
-            "recommendation": recommendation,
-            "impacts": [i.to_dict() for i in impacts],
-            "sources": [
-                {k: env.get(k) for k in ("source", "source_url", "fetched_at", "version", "error")}
-                | {"items_count": len(env.get("items") or [])}
-                for k, env in data.items()
-                if isinstance(env, dict) and "source" in env
-            ],
-            "errors": data.get("errors", {}),
-        }
-        app.calcs.set(result["calculation_id"], result, expire=CALC_TTL)
-        return jsonify(result)
+        result = metrics_analyze(
+            data, start, end,
+            duration_hours=duration_h,
+            cutoff=cutoff,
+        )
+        payload = result.to_dict()
+        payload["calculation_id"] = uuid.uuid4().hex[:12]
+        payload["algorithm_version"] = ALGO_VERSION
+        app.calcs.set(payload["calculation_id"], payload, expire=CALC_TTL)
+        return jsonify(payload)
 
     # --- get / list / export ---
 
@@ -149,7 +128,6 @@ def register_routes(app: Flask) -> None:
 
     @app.get("/api/calculations")
     def calculations_list():
-        # diskcache не умеет range-запросы, но легко перебрать ключи
         items = []
         for k in app.calcs.iterkeys():
             v = app.calcs.get(k)
@@ -159,7 +137,10 @@ def register_routes(app: Flask) -> None:
                     "created_at": v.get("created_at"),
                     "mode": v.get("mode"),
                     "start": v.get("start"),
-                    "duration_hours": v.get("duration_hours"),
+                    "duration_hours": (
+                        v.get("windows", [{}])[0].get("duration_minutes", 0) // 60
+                        if v.get("windows") else None
+                    ),
                 })
         items.sort(key=lambda x: x.get("created_at") or "", reverse=True)
         return jsonify({"items": items[:20]})
@@ -184,14 +165,52 @@ def register_routes(app: Flask) -> None:
         import csv, io
         buf = io.StringIO()
         w = csv.writer(buf)
-        w.writerow(["window_id", "start", "end", "bad_min", "warn_min", "threats"])
+
+        # Шапка метаданных
+        w.writerow(["# calculation_id", row.get("calculation_id") or calc_id])
+        w.writerow(["# algorithm_version", row.get("algorithm_version")])
+        w.writerow(["# mode", row.get("mode")])
+        w.writerow(["# cutoff", row.get("cutoff") or "—"])
+        w.writerow(["# start", row.get("start")])
+        w.writerow(["# end", row.get("end")])
+
+        rec = row.get("recommendation") or {}
+        w.writerow(["# recommendation.outcome", rec.get("outcome")])
+        w.writerow(["# recommendation.window_id", rec.get("window_id")])
+        w.writerow(["# recommendation.reason", rec.get("reason")])
+        w.writerow([])
+
+        # Окна
+        w.writerow([
+            "window_id", "start", "end", "duration_min",
+            "peak_level_lo", "peak_level_hi",
+            "minutes_at_warning", "confidence",
+            "warnings_count",
+        ])
         for win in row.get("windows", []):
-            threats = (win.get("threats_critical") or []) + (win.get("threats_minor") or [])
             w.writerow([
-                win.get("id"), win.get("start"), win.get("end"),
-                win.get("minutes_bad"), win.get("minutes_warn"),
-                "; ".join(threats),
+                win.get("id"),
+                win.get("start"), win.get("end"),
+                win.get("duration_minutes"),
+                win.get("peak_level_lo"), win.get("peak_level_hi"),
+                win.get("minutes_at_warning"),
+                win.get("confidence"),
+                len(win.get("warnings") or []),
             ])
+
+        w.writerow([])
+        w.writerow(["# lines_global"])
+        w.writerow(["name", "mechanism", "contributes", "is_nd",
+                    "level_lo", "level_hi", "confidence", "kind", "sources"])
+        for line in row.get("lines_global", []):
+            w.writerow([
+                line.get("name"), line.get("mechanism"),
+                line.get("contributes"), line.get("is_nd"),
+                line.get("level_lo"), line.get("level_hi"),
+                line.get("confidence"), line.get("kind"),
+                "; ".join(line.get("sources") or []),
+            ])
+
         return Response(
             buf.getvalue(),
             mimetype="text/csv",
@@ -202,13 +221,13 @@ def register_routes(app: Flask) -> None:
 
     @app.get("/api/sources")
     def sources_state():
-        # просто отдаём перечень зарегистрированных источников + TTL
         return jsonify({"items": sources.list_registered_sources()})
 
     @app.post("/api/refresh")
     def refresh():
         sources.invalidate_cache()
         return jsonify({"status": "refreshed", "time_utc": _iso_z(_now())})
+
 
 
 app = create_app()

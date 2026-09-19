@@ -4,7 +4,6 @@
 {% block content %}
 <div class="main-grid">
 
-  <!-- ======================== ЛЕВАЯ КОЛОНКА: ФОРМА ======================== -->
   <aside class="glass glass-section reveal">
     <h3 class="glass-title mb-3">
       <i class="bi bi-sliders2 me-2"></i>Параметры запроса
@@ -56,107 +55,22 @@
 
       <div id="formStatus" class="mt-3 small text-muted"></div>
     </form>
-
-    <hr class="my-4" style="border-color: rgba(255,255,255,.08);">
-
-    <div class="small text-muted">
-      <div class="d-flex justify-content-between mb-1">
-        <span>Алгоритм</span><span id="algoVersion">—</span>
-      </div>
-      <div class="d-flex justify-content-between mb-1">
-        <span>Расчёт</span><span id="calcId">—</span>
-      </div>
-      <div class="d-flex justify-content-between">
-        <span>Время</span><span id="calcTime">—</span>
-      </div>
-    </div>
   </aside>
 
-  <!-- ======================== ПРАВАЯ КОЛОНКА: РЕЗУЛЬТАТЫ ======================== -->
   <div class="d-flex flex-column gap-3">
-
-    <!-- Рекомендация -->
-    <section class="glass glass-section reveal delay-1" id="recommendationCard">
-      <div class="d-flex justify-content-between align-items-start">
-        <div>
-          <div class="section-title mb-1">Рекомендация</div>
-          <h4 class="glass-title mb-1" id="recTitle">Ожидание запроса</h4>
-          <div class="text-muted small" id="recReason">
-            Заполните форму и запустите анализ.
-          </div>
-        </div>
-        <div class="text-end">
-          <div class="badge-soft badge-muted" id="recScore">score —</div>
-        </div>
+    <section class="glass glass-section reveal">
+      <div class="section-title mb-2">Как это работает</div>
+      <div class="small text-muted">
+        Заполните параметры и запустите анализ. Сервис соберёт данные из открытых
+        источников (NOAA SWPC, GFZ, NASA DONKI, NCEI, Space-Track, CelesTrak),
+        построит линии риска и покажет окна-кандидаты с обоснованием.
       </div>
-
-      <div class="d-flex gap-2 mt-3">
-        <button class="btn-glass" id="exportJsonBtn" disabled>
-          <i class="bi bi-filetype-json"></i> JSON
-        </button>
-        <button class="btn-glass" id="exportCsvBtn" disabled>
-          <i class="bi bi-filetype-csv"></i> CSV
-        </button>
-        <button class="btn-glass" id="refreshBtn">
-          <i class="bi bi-arrow-clockwise"></i> Обновить
-        </button>
+      <div class="small text-muted mt-3">
+        <i class="bi bi-info-circle me-1"></i>
+        Прототип не предназначен для допуска к реальным ВКД.
       </div>
     </section>
-
-    <!-- Сравнение окон -->
-    <section class="glass glass-section reveal delay-2" id="windowsCard">
-      <div class="section-title">Сравнение окон</div>
-      <div id="windowsList">
-        <div class="empty-state">
-          <i class="bi bi-columns-gap"></i>
-          Здесь появятся окна-кандидаты с показателями угроз.
-        </div>
-      </div>
-    </section>
-
-    <!-- Таймлайн выбранного окна -->
-    <section class="glass glass-section reveal delay-3" id="timelineCard">
-      <div class="d-flex justify-content-between align-items-center mb-2">
-        <div class="section-title mb-0">Таймлайн выбранного окна</div>
-        <div class="small text-muted" id="timelineRange">—</div>
-      </div>
-
-      <div class="timeline-track" id="timelineTrack"></div>
-      <div class="timeline-ticks" id="timelineTicks"></div>
-
-      <div class="d-flex gap-3 mt-3 small text-muted">
-        <span><span class="badge-soft badge-good">good</span> благоприятно</span>
-        <span><span class="badge-soft badge-warn">warn</span> повышенный риск</span>
-        <span><span class="badge-soft badge-bad">bad</span> критично</span>
-      </div>
-    </section>
-
-    <!-- Предупреждения -->
-    <section class="glass glass-section reveal delay-4" id="warningsCard">
-      <div class="section-title">Предупреждения и доказательства</div>
-      <div id="warningsList">
-        <div class="empty-state">
-          <i class="bi bi-shield-check"></i>
-          Пока нет предупреждений. Запустите анализ.
-        </div>
-      </div>
-    </section>
-
-    <!-- Источники и ограничения -->
-    <section class="glass glass-section reveal delay-5" id="sourcesCard">
-      <div class="d-flex justify-content-between align-items-center mb-2">
-        <div class="section-title mb-0">Источники и ограничения</div>
-        <button class="btn-glass" data-bs-toggle="collapse" data-bs-target="#sourcesBody">
-          <i class="bi bi-chevron-expand"></i> Развернуть
-        </button>
-      </div>
-      <div class="collapse" id="sourcesBody">
-        <div id="sourcesList" class="small text-muted">
-          Данные появятся после запроса.
-        </div>
-      </div>
-    </section>
-
   </div>
+
 </div>
 {% endblock %}

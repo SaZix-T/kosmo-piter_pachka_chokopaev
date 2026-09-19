@@ -791,3 +791,20 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .stagger, .reveal-on-scroll, .toast-item, .compare-bar { animation: none !important; transition: none !important; opacity: 1 !important; transform: none !important; width: var(--w, 100%) !important; }
 }
+
+
+.level-0 { background: rgba(148,163,184,0.25); color:#e2e8f0; }
+.level-1 { background: rgba(56,189,248,0.35); color:#fff; }
+.level-2 { background: rgba(250,204,21,0.45); color:#1a1a1a; }
+.level-3 { background: rgba(249,115,22,0.55); color:#fff; }
+.level-4 { background: rgba(239,68,68,0.65); color:#fff; }
+.level-nd { background: rgba(120,113,108,0.45); color:#e5e7eb;
+            border:1px dashed rgba(255,255,255,0.35); }
+
+.kind-obs  { background: rgba(34,197,94,0.30);  color:#dcfce7; }
+.kind-fcst { background: rgba(168,85,247,0.30); color:#f3e8ff; }
+.kind-calc { background: rgba(14,165,233,0.30); color:#e0f2fe; }
+.kind-mixed{ background: rgba(148,163,184,0.30);color:#f1f5f9; }
+
+.table-dark { --bs-table-bg: transparent; --bs-table-color: #e8eefc; }
+code { color: #a5f3fc; }

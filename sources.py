@@ -1,6 +1,10 @@
 """
 sources.py — слой доступа к внешним данным для анализа рисков ВКД.
 
+Соответствует реестру источников Reestr_istochnikov_VKD.xlsx.
+Расчётные компоненты (SGP4, IGRF-14, собственный расчёт сближений)
+живут в analysis/orbit.py и здесь не реализованы.
+
 Возвращает единый envelope:
     {
         "items": [...],
@@ -12,17 +16,13 @@ sources.py — слой доступа к внешним данным для а�
         "units": str | None,
         "limitations": str | None,
         "error": str | None,
+        "mode": str | None,
     }
 
-Пустой items + error=None  →  данных нет за период (не означает «безопасно»).
-Пустой items + error!=None →  источник недоступен.
-
-Режимы источников:
-    current     — live-данные (SWPC, SOCRATES, CelesTrak GP, Kp forecast)
+Режимы:
+    current     — live (SWPC, SOCRATES, CelesTrak GP)
     historical  — архив с фильтром по времени публикации (cutoff)
-    both        — работает в обоих режимах (DONKI, GFZ, GOES SGPS, Space-Track history)
-
-Не знает про Impact, good/warn/bad и пороги — это ответственность metrics.py.
+    both        — работает в обоих режимах (DONKI, GFZ, GOES, RSGA, Space-Track history)
 """
 from __future__ import annotations
 
@@ -36,9 +36,6 @@ from urllib.parse import urljoin
 
 from requests_cache import CachedSession
 
-# ---------------------------------------------------------------------------
-# Опциональные зависимости
-# ---------------------------------------------------------------------------
 try:
     from spacetrack import SpaceTrackClient
     import spacetrack.operators as op
@@ -55,17 +52,18 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Конфигурация кэша
+# Кэш
 # ---------------------------------------------------------------------------
 
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 _URLS_EXPIRE: Dict[str, int] = {
-    "celestrak.org/NORAD/elements/": 3600,
+    "celestrak.org/NORAD/elements/": 7200,
     "space-track.org/basicspacedata/query/class/gp_history": 86400,
     "space-track.org/basicspacedata/query/class/cdm_public": 1800,
     "data.ngdc.noaa.gov/platforms/solar-space-observing-satellites/": 86400,
+    "www.ngdc.noaa.gov/stp/space-weather/swpc-products/daily_reports/": 86400,
     "services.swpc.noaa.gov/": 300,
     "api.nasa.gov/DONKI/": 600,
     "kp.gfz.de/app/json/": 1800,
@@ -85,7 +83,6 @@ _TTL_MAP: List[Tuple[str, int]] = list(_URLS_EXPIRE.items())
 
 
 def configure(cache_dir: Optional[str] = None) -> None:
-    """Переопределить директорию кэша (вызывается из app.py)."""
     global CACHE_DIR, session
     if cache_dir:
         CACHE_DIR = Path(cache_dir)
@@ -102,7 +99,6 @@ def configure(cache_dir: Optional[str] = None) -> None:
 
 
 def set_ttl(pattern: str, seconds: int) -> None:
-    """Программно изменить TTL для паттерна."""
     global _TTL_MAP
     _TTL_MAP = [(p, t) for p, t in _TTL_MAP if p != pattern]
     _TTL_MAP.insert(0, (pattern, seconds))
@@ -110,7 +106,6 @@ def set_ttl(pattern: str, seconds: int) -> None:
 
 
 def invalidate_cache() -> None:
-    """Полный сброс HTTP-кэша."""
     session.cache.clear()
 
 
@@ -127,7 +122,6 @@ def _iso_z(x: datetime) -> str:
 
 
 def _gfz_fmt(x: datetime) -> str:
-    """GFZ принимает только YYYY-MM-DDThh:mm:ssZ (без микросекунд)."""
     return x.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -201,7 +195,7 @@ def _to_float(v) -> Optional[float]:
 
 
 # ===========================================================================
-# 1. CELESTRAK — текущий TLE МКС (current only)
+# SAA-2. CelesTrak GP — текущий TLE МКС (current only)
 # ===========================================================================
 
 CELESTRAK_TLE_ISS = (
@@ -210,10 +204,6 @@ CELESTRAK_TLE_ISS = (
 
 
 def fetch_tle_iss() -> Dict[str, Any]:
-    """Текущий TLE МКС из CelesTrak. Только current.
-
-    В historical использовать fetch_tle_history.
-    """
     try:
         r = session.get(CELESTRAK_TLE_ISS, timeout=15)
         r.raise_for_status()
@@ -233,8 +223,7 @@ def fetch_tle_iss() -> Dict[str, Any]:
 
     name, l1, l2 = lines[0], lines[1], lines[2]
     return _envelope(
-        items=[{"name": name, "line1": l1, "line2": l2,
-                "epoch_utc": _tle_epoch(l1)}],
+        items=[{"name": name, "line1": l1, "line2": l2, "epoch_utc": _tle_epoch(l1)}],
         source="Celestrak GP", source_url=CELESTRAK_TLE_ISS,
         version="gp.php", units="TLE", mode="current",
         limitations="TLE ISS обновляется ~раз в сутки; давность = now - epoch.",
@@ -242,7 +231,7 @@ def fetch_tle_iss() -> Dict[str, Any]:
 
 
 # ===========================================================================
-# 2. SPACE-TRACK — исторический TLE (gp_history, historical only)
+# SAA-1. Space-Track gp_history — исторический TLE (historical)
 # ===========================================================================
 
 def fetch_tle_history(
@@ -252,10 +241,11 @@ def fetch_tle_history(
     cutoff: Optional[datetime] = None,
     norad_id: int = 25544,
 ) -> Dict[str, Any]:
-    """gp_history: все публикации TLE за [start, end].
+    """gp_history по EPOCH. Cutoff по CREATION_DATE (T4).
 
-    cutoff — момент запроса пользователя; более поздние публикации
-    отбрасываются (T4, replay). Фильтр по CREATION_DATE, а не по EPOCH.
+    Аналитик указывает запрос по EPOCH=2024-04-25..2024-07-01, чтобы
+    для первых окон был предыдущий набор элементов. Replay — по
+    CREATION_DATE <= cutoff.
     """
     if not _HAS_SPACETRACK:
         return _envelope(
@@ -267,13 +257,13 @@ def fetch_tle_history(
 
     try:
         identity, password = _st_creds()
-        drange = op.inclusive_range(start - timedelta(days=7), end)
+        epoch_range = op.inclusive_range(start - timedelta(days=7), end)
         items: List[Dict[str, Any]] = []
         with SpaceTrackClient(identity=identity, password=password) as st:
             raw = st.gp_history(
                 norad_cat_id=norad_id,
-                creation_date=drange,
-                orderby="CREATION_DATE",
+                epoch=epoch_range,        # SAA-1: запрос по EPOCH
+                orderby="EPOCH",
                 format="json",
             )
         data = json.loads(raw) if isinstance(raw, str) else raw
@@ -303,14 +293,14 @@ def fetch_tle_history(
         version="gp_history", units="TLE", mode="historical",
         publication_time=cutoff,
         limitations=(
-            "Исторические TLE отдаются с задержкой публикации; "
-            "для строгого replay фильтруем по CREATION_DATE."
+            "Запрос по EPOCH, cutoff по CREATION_DATE. "
+            "Пробелы больше суток между элементами — считать пропусками (T1)."
         ),
     )
 
 
 # ===========================================================================
-# 3. SPACE-TRACK — сближения (cdm_public, historical)
+# CONJ-1 / CONJ-3. Space-Track cdm_public — сближения (historical)
 # ===========================================================================
 
 def fetch_conjunctions(
@@ -320,17 +310,17 @@ def fetch_conjunctions(
     cutoff: Optional[datetime] = None,
     sat_id: int = 25544,
 ) -> Dict[str, Any]:
-    """cdm_public: CDM для МКС (МКС может быть SAT_1 или SAT_2).
+    """cdm_public: МКС может быть SAT_1_ID или SAT_2_ID.
 
-    cutoff фильтрует по CREATED, а не по TCA (T4, replay).
+    Два запроса. Cutoff по CREATED, дедуп по (объект, TCA).
+    CONJ-3 (будущие TCA) покрывается тем же вызовом.
     """
     if not _HAS_SPACETRACK:
         return _envelope(
             items=[], source="Space-Track cdm_public",
             source_url="https://www.space-track.org/basicspacedata/query/class/cdm_public",
-            error="spacetrack не установлен",
+            error="spacetrack не установлен", mode="historical",
             limitations="Без Space-Track сближения не проверяются.",
-            mode="historical",
         )
 
     try:
@@ -340,12 +330,10 @@ def fetch_conjunctions(
         with SpaceTrackClient(identity=identity, password=password) as st:
             for field in ("sat_1_id", "sat_2_id"):
                 raw = st.generic_request(
-                    "cdm_public",
-                    controller="basicspacedata",
+                    "cdm_public", controller="basicspacedata",
                     **{field: sat_id},
                     tca=tca_range,
-                    orderby="TCA asc",
-                    format="json",
+                    orderby="TCA asc", format="json",
                 )
                 data = json.loads(raw) if isinstance(raw, str) else raw
                 all_items.extend(_normalize_cdm(x) for x in data if x.get("TCA"))
@@ -375,10 +363,10 @@ def fetch_conjunctions(
         version="cdm_public", units="probability / km", mode="historical",
         publication_time=cutoff,
         limitations=(
-            "CDM публикуются с задержкой; поздние уточнения не учитываются "
-            "в историческом режиме (cutoff по CREATED). Для МКС cdm_public "
-            "часто пуст: публичные CDM по пилотируемым объектам не публикуются. "
-            "Отсутствие записей не означает отсутствие сближений."
+            "Два запроса (SAT_1_ID и SAT_2_ID), дедуп по (объект, TCA). "
+            "Cutoff по CREATED. Для МКС cdm_public часто пуст — публичные CDM "
+            "по пилотируемым объектам не публикуются. Отсутствие записей "
+            "не означает отсутствие сближений. CDM-сервис переносится в TraCSS."
         ),
     )
 
@@ -400,7 +388,7 @@ def _normalize_cdm(x: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ===========================================================================
-# 4. CELESTRAK — SOCRATES Plus (current only, резерв для сближений)
+# CONJ-2. CelesTrak SOCRATES Plus (current only)
 # ===========================================================================
 
 SOCRATES_URL = (
@@ -410,44 +398,33 @@ SOCRATES_URL = (
 
 
 class _SocratesParser:
-    """Минимальный HTML-парсер таблицы SOCRATES."""
     def __init__(self):
         from html.parser import HTMLParser
         self.rows: List[List[str]] = []
         self._row: List[str] = []
         self._cell: List[str] = []
         self._in_cell = False
-        self._parser = _SocratesHTML(self)
-
-    def feed(self, html: str) -> None:
-        self._parser.feed(html)
-
-
-class _SocratesHTML:
-    def __init__(self, parent):
-        from html.parser import HTMLParser
-        self.parent = parent
         outer = self
 
         class _Inner(HTMLParser):
             def handle_starttag(self, tag, attrs):
                 if tag == "tr":
-                    outer.parent._row = []
+                    outer._row = []
                 elif tag in ("td", "th"):
-                    outer.parent._in_cell = True
-                    outer.parent._cell = []
+                    outer._in_cell = True
+                    outer._cell = []
 
             def handle_endtag(self, tag):
                 if tag in ("td", "th"):
-                    outer.parent._in_cell = False
-                    outer.parent._row.append("".join(outer.parent._cell).strip())
+                    outer._in_cell = False
+                    outer._row.append("".join(outer._cell).strip())
                 elif tag == "tr":
-                    if outer.parent._row:
-                        outer.parent.rows.append(outer.parent._row)
+                    if outer._row:
+                        outer.rows.append(outer._row)
 
             def handle_data(self, data):
-                if outer.parent._in_cell:
-                    outer.parent._cell.append(data)
+                if outer._in_cell:
+                    outer._cell.append(data)
 
         self._inner = _Inner()
 
@@ -475,7 +452,6 @@ def _parse_socrates_html(html: str) -> List[Dict[str, Any]]:
 
 
 def fetch_socrates() -> Dict[str, Any]:
-    """SOCRATES Plus: HTML-таблица. Только current, архива нет."""
     try:
         r = session.get(SOCRATES_URL, timeout=20)
         r.raise_for_status()
@@ -483,9 +459,8 @@ def fetch_socrates() -> Dict[str, Any]:
         return _envelope(
             items=[], source="Celestrak SOCRATES",
             source_url=SOCRATES_URL,
-            error=f"{type(e).__name__}: {e}",
-            mode="current",
-            limitations="Только текущие сближения; архива нет (CONJ-2).",
+            error=f"{type(e).__name__}: {e}", mode="current",
+            limitations="Только текущие сближения (7 суток вперёд, порог 5 км); архива нет.",
         )
 
     m = re.search(r"Data current as of\s*([^<]+)", r.text, re.IGNORECASE)
@@ -497,9 +472,7 @@ def fetch_socrates() -> Dict[str, Any]:
         return _envelope(
             items=[], source="Celestrak SOCRATES",
             source_url=SOCRATES_URL,
-            error=f"parse: {type(e).__name__}: {e}",
-            mode="current",
-            limitations="Только текущие сближения; архива нет.",
+            error=f"parse: {type(e).__name__}: {e}", mode="current",
         )
 
     return _envelope(
@@ -508,21 +481,20 @@ def fetch_socrates() -> Dict[str, Any]:
         version=f"SOCRATES Plus (data current as of {data_current})" if data_current else "SOCRATES Plus",
         units="km / Pc", mode="current",
         limitations=(
-            "SOCRATES даёт верхнюю оценку Pc; не смешивать с Pc из CDM. "
+            "Pc — консервативная верхняя оценка, не смешивать с Pc из CDM. "
             "Только текущее, архива нет."
         ),
     )
 
 
 # ===========================================================================
-# 5. NOAA SWPC — оперативные данные (current only)
+# SEP-2 / SEP-3 / SEP-4 / G-2 / G-3. NOAA SWPC (current only)
 # ===========================================================================
 
 SWPC_BASE = "https://services.swpc.noaa.gov"
 
 
 def _rows_from_swpc_json(raw) -> List[Dict[str, Any]]:
-    """SWPC отдаёт либо [header, ...rows], либо [{...}, ...]."""
     if not raw:
         return []
     if isinstance(raw[0], dict):
@@ -531,19 +503,9 @@ def _rows_from_swpc_json(raw) -> List[Dict[str, Any]]:
     return [dict(zip(header, row)) for row in rows]
 
 
-def _swpc_live_only(source: str, url: str) -> Dict[str, Any]:
-    """Заглушка для historical-режима: SWPC не имеет архива."""
-    return _envelope(
-        items=[], source=source, source_url=url,
-        error="SWPC не хранит архив; источник только для current режима",
-        mode="current",
-        limitations="Для replay используйте NCEI/GFZ/DONKI.",
-    )
-
-
 def fetch_swpc_protons() -> Dict[str, Any]:
-    """Интегральные протоны GOES (1-day). Канал ≥10 МэВ. Current only."""
-    url = f"{SWPC_BASE}/json/goes/primary/integral-protons-1-day.json"
+    """SEP-2. Интегральные протоны GOES, канал ≥10 МэВ."""
+    url = f"{SWPC_BASE}/json/goes/primary/integral-protons-7-day.json"
     try:
         r = session.get(url, timeout=15)
         r.raise_for_status()
@@ -551,8 +513,7 @@ def fetch_swpc_protons() -> Dict[str, Any]:
     except Exception as e:
         return _envelope(
             items=[], source="NOAA SWPC protons",
-            source_url=url, error=f"{type(e).__name__}: {e}",
-            mode="current",
+            source_url=url, error=f"{type(e).__name__}: {e}", mode="current",
         )
 
     items: List[Dict[str, Any]] = []
@@ -572,14 +533,14 @@ def fetch_swpc_protons() -> Dict[str, Any]:
 
     return _envelope(
         items=items, source="NOAA SWPC protons",
-        source_url=url, version="integral-protons-1-day",
+        source_url=url, version="integral-protons-7-day",
         units="pfu", mode="current",
-        limitations="SWPC отдаёт последние сутки; для replay — NCEI SGPS (SEP-1).",
+        limitations="Только последние 7 суток; архива нет. Для replay — SEP-1 или SEP-5.",
     )
 
 
 def fetch_swpc_kp() -> Dict[str, Any]:
-    """Планетарный Kp (оценка по 8 из 13 станций). Current only."""
+    """G-2. Планетарный Kp (оценка по 8 из 13 станций)."""
     url = f"{SWPC_BASE}/products/noaa-planetary-k-index.json"
     try:
         r = session.get(url, timeout=15)
@@ -588,8 +549,7 @@ def fetch_swpc_kp() -> Dict[str, Any]:
     except Exception as e:
         return _envelope(
             items=[], source="NOAA SWPC Kp",
-            source_url=url, error=f"{type(e).__name__}: {e}",
-            mode="current",
+            source_url=url, error=f"{type(e).__name__}: {e}", mode="current",
         )
 
     items: List[Dict[str, Any]] = []
@@ -610,13 +570,13 @@ def fetch_swpc_kp() -> Dict[str, Any]:
         units="Kp", mode="current",
         limitations=(
             "Оценка по 8 из 13 станций; station_count — индикатор уверенности. "
-            "Только последние ~7 суток; архива нет."
+            "Только последние ~7 суток."
         ),
     )
 
 
 def fetch_swpc_kp_forecast() -> Dict[str, Any]:
-    """Прогноз Kp по 3-часовым интервалам. Current only."""
+    """G-3. Прогноз Kp по 3-часовым интервалам (observed + forecast)."""
     url = f"{SWPC_BASE}/products/noaa-planetary-k-index-forecast.json"
     try:
         r = session.get(url, timeout=15)
@@ -625,8 +585,7 @@ def fetch_swpc_kp_forecast() -> Dict[str, Any]:
     except Exception as e:
         return _envelope(
             items=[], source="NOAA SWPC Kp forecast",
-            source_url=url, error=f"{type(e).__name__}: {e}",
-            mode="current",
+            source_url=url, error=f"{type(e).__name__}: {e}", mode="current",
         )
 
     items: List[Dict[str, Any]] = []
@@ -646,14 +605,14 @@ def fetch_swpc_kp_forecast() -> Dict[str, Any]:
         source_url=url, version="planetary-k-index-forecast",
         units="Kp", mode="current",
         limitations=(
-            "Смесь observed (прошлое) и forecast (будущее); "
-            "фильтруйте по полю 'observed'. Архива нет."
+            "Смесь observed (прошлое) и forecast (будущее); фильтруйте "
+            "по 'observed'. Обновляется несколько раз в сутки."
         ),
     )
 
 
 def fetch_swpc_alerts() -> Dict[str, Any]:
-    """Активные alerts/watches/warnings SWPC. Current only."""
+    """SEP-3. Активные alerts/watches/warnings."""
     url = f"{SWPC_BASE}/products/alerts.json"
     try:
         r = session.get(url, timeout=15)
@@ -662,8 +621,7 @@ def fetch_swpc_alerts() -> Dict[str, Any]:
     except Exception as e:
         return _envelope(
             items=[], source="NOAA SWPC alerts",
-            source_url=url, error=f"{type(e).__name__}: {e}",
-            mode="current",
+            source_url=url, error=f"{type(e).__name__}: {e}", mode="current",
         )
 
     items: List[Dict[str, Any]] = []
@@ -681,13 +639,13 @@ def fetch_swpc_alerts() -> Dict[str, Any]:
         source_url=url, version="alerts", units="—", mode="current",
         limitations=(
             "Три времени (issued, valid_from, valid_to) хранить раздельно. "
-            "Архива нет; для replay — NCEI RSGA (SEP-5)."
+            "Архива нет; для replay — SEP-5 (RSGA)."
         ),
     )
 
 
 def fetch_swpc_3day_forecast() -> Dict[str, Any]:
-    """3-day forecast (текст). Current only."""
+    """SEP-4. 3-day forecast (текст)."""
     url = f"{SWPC_BASE}/text/3-day-forecast.txt"
     try:
         r = session.get(url, timeout=15)
@@ -695,8 +653,7 @@ def fetch_swpc_3day_forecast() -> Dict[str, Any]:
     except Exception as e:
         return _envelope(
             items=[], source="NOAA SWPC 3-day forecast",
-            source_url=url, error=f"{type(e).__name__}: {e}",
-            mode="current",
+            source_url=url, error=f"{type(e).__name__}: {e}", mode="current",
         )
 
     text = r.text
@@ -712,13 +669,13 @@ def fetch_swpc_3day_forecast() -> Dict[str, Any]:
         units="—", mode="current",
         limitations=(
             "Текстовый формат; разбор вероятностей требует тестов (T7). "
-            "Архива нет."
+            "Выпускается в 00:30 и 12:30 UTC, плюс внеплановые."
         ),
     )
 
 
 # ===========================================================================
-# 6. GFZ POTSDAM — Kp (both: nowcast для current, def для historical)
+# G-1. GFZ Potsdam — Kp (both: nowcast/current, def/historical)
 # ===========================================================================
 
 GFZ_KP_URL = "https://kp.gfz.de/app/json/"
@@ -731,11 +688,6 @@ def fetch_gfz_kp(
     cutoff: Optional[datetime] = None,
     lookback_days: int = 3,
 ) -> Dict[str, Any]:
-    """Kp из GFZ (3-часовой, без прогноза вперёд).
-
-    status='def' — окончательные значения, доступны с задержкой >45 дней.
-    status='all' — nowcast для свежих дат.
-    """
     now = _now()
     is_historical = cutoff is not None
     if is_historical and (now - cutoff).days > 45:
@@ -744,7 +696,7 @@ def fetch_gfz_kp(
         mode = "historical"
         limitations = (
             "Архивное значение (def): окончательные данные, не то, "
-            "что было известно оператору. Для оперативных — SWPC Kp (G-2)."
+            "что было известно оператору. Для оперативных — G-2 (SWPC Kp)."
         )
     else:
         status = "all"
@@ -752,12 +704,11 @@ def fetch_gfz_kp(
         mode = "current"
         limitations = (
             "Смесь nowcast/definitive. GFZ не даёт прогноз вперёд; "
-            "для будущих окон используйте SWPC Kp forecast."
+            "для будущих окон используйте G-3 (SWPC Kp forecast)."
         )
 
     query_start = min(start, end) - timedelta(days=lookback_days)
     query_end = max(start, end)
-
     params = {
         "start": _gfz_fmt(query_start),
         "end": _gfz_fmt(query_end),
@@ -771,8 +722,7 @@ def fetch_gfz_kp(
     except Exception as e:
         return _envelope(
             items=[], source="GFZ Potsdam Kp",
-            source_url=GFZ_KP_URL,
-            error=f"{type(e).__name__}: {e}",
+            source_url=GFZ_KP_URL, error=f"{type(e).__name__}: {e}",
             limitations=limitations, mode=mode,
         )
 
@@ -792,15 +742,14 @@ def fetch_gfz_kp(
 
     return _envelope(
         items=items, source="GFZ Potsdam Kp",
-        source_url=r.url,
-        version=version, units="Kp", mode=mode,
+        source_url=r.url, version=version, units="Kp", mode=mode,
         publication_time=cutoff,
         limitations=limitations,
     )
 
 
 # ===========================================================================
-# 7. NASA DONKI — архив событий (both)
+# SEP-6 / G-4. NASA DONKI (both)
 # ===========================================================================
 
 DONKI_BASE = "https://api.nasa.gov/DONKI"
@@ -808,7 +757,7 @@ DONKI_MAX_WINDOW_DAYS = 30
 
 
 def _donki_api_key() -> str:
-    return os.getenv("NASA_API_KEY", "DEMO_KEY")
+    return os.getenv("NASA_API_KEY", "lhyGGEeblDkRmjqsShnBLs8BTX5Q1CpNDJYAvZ4m")
 
 
 def _donki_get(path: str, start: datetime, end: datetime,
@@ -820,8 +769,7 @@ def _donki_get(path: str, start: datetime, end: datetime,
     }
     if extra:
         params.update(extra)
-    url = f"{DONKI_BASE}{path}"
-    r = session.get(url, params=params, timeout=30)
+    r = session.get(f"{DONKI_BASE}{path}", params=params, timeout=30)
     r.raise_for_status()
     return r.json()
 
@@ -834,7 +782,7 @@ def _donki_windows(start: datetime, end: datetime) -> Iterable[Tuple[datetime, d
         cur = nxt
 
 
-def _donki_filter_cutoff(items, cutoff, field):
+def _donki_cutoff(items, cutoff, field):
     if cutoff:
         items = [i for i in items
                  if i.get(field) and _parse_iso(i[field]) <= cutoff]
@@ -842,7 +790,7 @@ def _donki_filter_cutoff(items, cutoff, field):
 
 
 def fetch_donki_sep(start, end, *, cutoff=None) -> Dict[str, Any]:
-    """DONKI SEP — каталог событий (не прогноз)."""
+    """SEP-6. DONKI SEP — каталог событий."""
     items: List[Dict[str, Any]] = []
     try:
         for s, e in _donki_windows(start, end):
@@ -863,7 +811,7 @@ def fetch_donki_sep(start, end, *, cutoff=None) -> Dict[str, Any]:
             mode="historical" if cutoff else "current",
         )
 
-    items = _donki_filter_cutoff(items, cutoff, "submission_time")
+    items = _donki_cutoff(items, cutoff, "submission_time")
     items = _dedup(items, "sep_id")
     return _envelope(
         items=items, source="NASA DONKI SEP",
@@ -871,12 +819,49 @@ def fetch_donki_sep(start, end, *, cutoff=None) -> Dict[str, Any]:
         version="DONKI SEP", units="—",
         mode="historical" if cutoff else "current",
         publication_time=cutoff,
-        limitations="Каталог событий. Replay — по submissionTime.",
+        limitations=(
+            "Каталог событий, не прогноз. Официальный прогноз — SEP-3/SEP-4. "
+            "Replay — по submissionTime. Максимум 30 дней за запрос."
+        ),
+    )
+
+
+def fetch_donki_notifications(start, end, *, cutoff=None) -> Dict[str, Any]:
+    """SEP-6. DONKI notifications."""
+    items: List[Dict[str, Any]] = []
+    try:
+        for s, e in _donki_windows(start, end):
+            data = _donki_get("/notifications", s, e, {"type": "all"})
+            for x in data or []:
+                items.append({
+                    "message_id": x.get("messageID"),
+                    "message_type": x.get("messageType"),
+                    "message_issue_time": x.get("messageIssueTime"),
+                    "message_url": x.get("messageURL"),
+                    "message_body": (x.get("messageBody") or "")[:2000],
+                })
+    except Exception as e:
+        return _envelope(
+            items=[], source="NASA DONKI notifications",
+            source_url=f"{DONKI_BASE}/notifications",
+            error=f"{type(e).__name__}: {e}",
+            mode="historical" if cutoff else "current",
+        )
+
+    items = _donki_cutoff(items, cutoff, "message_issue_time")
+    items = _dedup(items, "message_id")
+    return _envelope(
+        items=items, source="NASA DONKI notifications",
+        source_url=f"{DONKI_BASE}/notifications",
+        version="DONKI notifications", units="—",
+        mode="historical" if cutoff else "current",
+        publication_time=cutoff,
+        limitations="Replay — по messageIssueTime. Максимум 30 дней за запрос.",
     )
 
 
 def fetch_donki_gst(start, end, *, cutoff=None) -> Dict[str, Any]:
-    """DONKI GST — геомагнитные бури."""
+    """G-4. DONKI GST — геомагнитные бури."""
     items: List[Dict[str, Any]] = []
     try:
         for s, e in _donki_windows(start, end):
@@ -897,7 +882,7 @@ def fetch_donki_gst(start, end, *, cutoff=None) -> Dict[str, Any]:
             mode="historical" if cutoff else "current",
         )
 
-    items = _donki_filter_cutoff(items, cutoff, "submission_time")
+    items = _donki_cutoff(items, cutoff, "submission_time")
     items = _dedup(items, "gst_id")
     return _envelope(
         items=items, source="NASA DONKI GST",
@@ -905,12 +890,12 @@ def fetch_donki_gst(start, end, *, cutoff=None) -> Dict[str, Any]:
         version="DONKI GST", units="Kp",
         mode="historical" if cutoff else "current",
         publication_time=cutoff,
-        limitations="Replay по submissionTime.",
+        limitations="Replay — по submissionTime.",
     )
 
 
 def fetch_donki_cmeanalysis(start, end, *, cutoff=None) -> Dict[str, Any]:
-    """DONKI CMEAnalysis — WSA-ENLIL расчёт прихода CME (±7 ч)."""
+    """G-4. DONKI CMEAnalysis — WSA-ENLIL расчёт прихода CME (±7 ч)."""
     items: List[Dict[str, Any]] = []
     try:
         for s, e in _donki_windows(start, end):
@@ -934,7 +919,7 @@ def fetch_donki_cmeanalysis(start, end, *, cutoff=None) -> Dict[str, Any]:
             mode="historical" if cutoff else "current",
         )
 
-    items = _donki_filter_cutoff(items, cutoff, "submission_time")
+    items = _donki_cutoff(items, cutoff, "submission_time")
     items = _dedup(items, "analysis_id")
     return _envelope(
         items=items, source="NASA DONKI CMEAnalysis",
@@ -944,47 +929,13 @@ def fetch_donki_cmeanalysis(start, end, *, cutoff=None) -> Dict[str, Any]:
         publication_time=cutoff,
         limitations=(
             "Интервал прихода CME передавать как интервал, а не точку. "
-            "Replay — по submissionTime."
+            "Replay — по submissionTime (= время завершения расчёта)."
         ),
     )
 
 
-def fetch_donki_notifications(start, end, *, cutoff=None) -> Dict[str, Any]:
-    """DONKI notifications — сообщения с временем выпуска."""
-    items: List[Dict[str, Any]] = []
-    try:
-        for s, e in _donki_windows(start, end):
-            data = _donki_get("/notifications", s, e, {"type": "all"})
-            for x in data or []:
-                items.append({
-                    "message_id": x.get("messageID"),
-                    "message_type": x.get("messageType"),
-                    "message_issue_time": x.get("messageIssueTime"),
-                    "message_url": x.get("messageURL"),
-                    "message_body": (x.get("messageBody") or "")[:2000],
-                })
-    except Exception as e:
-        return _envelope(
-            items=[], source="NASA DONKI notifications",
-            source_url=f"{DONKI_BASE}/notifications",
-            error=f"{type(e).__name__}: {e}",
-            mode="historical" if cutoff else "current",
-        )
-
-    items = _donki_filter_cutoff(items, cutoff, "message_issue_time")
-    items = _dedup(items, "message_id")
-    return _envelope(
-        items=items, source="NASA DONKI notifications",
-        source_url=f"{DONKI_BASE}/notifications",
-        version="DONKI notifications", units="—",
-        mode="historical" if cutoff else "current",
-        publication_time=cutoff,
-        limitations="Максимум 30 дней за запрос. Replay — по messageIssueTime.",
-    )
-
-
 # ===========================================================================
-# 8. NOAA NCEI — GOES SGPS L2 avg5m (both, архив отстаёт ~7 суток)
+# SEP-1. NOAA NCEI — GOES SGPS L2 avg5m (both, архив отстаёт ~7 суток)
 # ===========================================================================
 
 GOES_BASE = (
@@ -1019,7 +970,7 @@ def _resolve_goes_file(day: datetime, sat: str) -> Optional[str]:
     return urljoin(dir_url, best[0])
 
 
-def fetch_sep_proton_flux(
+def fetch_sep_goes_archive(
     start: datetime,
     end: datetime,
     *,
@@ -1028,19 +979,14 @@ def fetch_sep_proton_flux(
     channels: Iterable[str] = ("P7",),
     include_integral: bool = True,
 ) -> Dict[str, Any]:
-    """Читает NetCDF GOES SGPS L2 avg5m.
-
-    sat: '16' для 2024-05 (East), '19' для current. Если None — env GOES_SAT.
-    """
     if not _HAS_NETCDF:
         return _envelope(
-            items=[], source="NOAA GOES SEP",
+            items=[], source="NOAA NCEI GOES SGPS",
             source_url="https://data.ngdc.noaa.gov/",
             error="netCDF4 не установлен: pip install netCDF4 cftime",
         )
 
     sat = sat or os.getenv("GOES_SAT", "16")
-
     points: List[Dict[str, Any]] = []
     urls: List[str] = []
     errors: List[str] = []
@@ -1051,7 +997,6 @@ def fetch_sep_proton_flux(
         if not url:
             day += timedelta(days=1)
             continue
-
         try:
             r = session.get(url, timeout=60)
             r.raise_for_status()
@@ -1065,18 +1010,16 @@ def fetch_sep_proton_flux(
             ds = nc.Dataset("inmemory.nc", memory=r.content)
             try:
                 times = _read_goes_time(ds)
-
                 if "AvgDiffProtonFlux" in ds.variables:
                     diff = ds["AvgDiffProtonFlux"]
-                    channel_names = _resolve_channel_names(diff)
+                    ch_names = _resolve_channel_names(diff)
                     for ch in channels:
-                        idx = _resolve_channel_index(ch, channel_names)
+                        idx = _resolve_channel_index(ch, ch_names)
                         if idx is None:
                             continue
                         series = diff[:][:, 0, idx]
                         _append_series(points, times, series, start, end, cutoff,
                                        kind="diff", channel=ch)
-
                 if include_integral and "AvgIntProtonFlux" in ds.variables:
                     integral = ds["AvgIntProtonFlux"]
                     series = integral[:][:, 0]
@@ -1086,7 +1029,6 @@ def fetch_sep_proton_flux(
                 ds.close()
         except Exception as e:
             errors.append(f"{day.date()} parse: {type(e).__name__}: {e}")
-
         day += timedelta(days=1)
 
     deduped: Dict[tuple, Dict[str, Any]] = {}
@@ -1094,17 +1036,17 @@ def fetch_sep_proton_flux(
         deduped[(p["time_utc"], p["kind"], p["channel"])] = p
     items = sorted(deduped.values(), key=lambda p: (p["time_utc"], p["channel"]))
 
-    error_msg = "; ".join(errors) if errors and not items else None
-    mode = "historical" if cutoff else "current"
-
     return _envelope(
         items=items, source=f"NOAA GOES-{sat} SGPS",
         source_url=urls[0] if urls else GOES_BASE.format(sat=sat, y=start.year, m=start.month),
-        version="sgps-l2-avg5m", units="pfu (protons/cm^2 s sr)",
-        publication_time=cutoff, error=error_msg, mode=mode,
+        version="sgps-l2-avg5m v3-0-3", units="pfu (protons/cm^2 s sr)",
+        publication_time=cutoff,
+        error="; ".join(errors) if errors and not items else None,
+        mode="historical" if cutoff else "current",
         limitations=(
             "SGPS L2 avg5m — 5-минутные средние. Версия файла берётся из листинга NCEI. "
-            "Архив NCEI отстаёт ~7 суток; для свежего current используйте SWPC protons."
+            "Архив NCEI отстаёт ~7 суток; для свежего current используйте SEP-2. "
+            "Дифференциальные каналы — по sensor_units[0] (west)."
         ),
     )
 
@@ -1125,10 +1067,8 @@ def _append_series(points, times, series, start, end, cutoff, *,
         if val <= 0:
             continue
         points.append({
-            "time_utc": _iso_z(t),
-            "kind": kind,
-            "channel": channel,
-            "flux_pfu": val,
+            "time_utc": _iso_z(t), "kind": kind,
+            "channel": channel, "flux_pfu": val,
         })
 
 
@@ -1152,9 +1092,8 @@ def _resolve_channel_names(var) -> List[str]:
 
 
 def _resolve_channel_index(wanted: str, channel_names: List[str]) -> Optional[int]:
-    wanted_upper = wanted.upper()
     for i, name in enumerate(channel_names):
-        if name == wanted_upper:
+        if name == wanted.upper():
             return i
     return None
 
@@ -1194,101 +1133,168 @@ def _read_goes_time(ds) -> List[datetime]:
 
 
 # ===========================================================================
-# 9. Метеороидные потоки (both, локальный JSON)
+# SEP-5. NCEI RSGA — ежедневный отчёт и прогноз (both, архив для replay)
 # ===========================================================================
 
-METEORS_LOCAL = Path(__file__).resolve().parent / "static" / "data" / "meteor_showers.json"
+RSGA_BASE = (
+    "https://www.ngdc.noaa.gov/stp/space-weather/swpc-products/"
+    "daily_reports/reports_solar_geophysical_activity/{y}/{m:02d}/"
+)
 
 
-def fetch_meteor_showers() -> Dict[str, Any]:
-    """Календарь метеороидных потоков из локального JSON."""
-    try:
-        raw = json.loads(METEORS_LOCAL.read_text(encoding="utf-8"))
-        items = raw if isinstance(raw, list) else raw.get("showers") or raw.get("items") or []
-        error = None
-    except Exception as e:
-        items = _METEORS_FALLBACK
-        error = f"local file: {type(e).__name__}: {e}"
+def _rsga_url(day: datetime) -> str:
+    fname = f"{day.strftime('%Y%m%d')}RSGA.txt"
+    return RSGA_BASE.format(y=day.year, m=day.month) + fname
+
+
+def _parse_rsga_issued(text: str, day: datetime) -> Optional[datetime]:
+    """Извлекает время выпуска из заголовка RSGA.
+
+    Варианты:
+      :Issued: 2024 May 10 0030 UTC
+      SDF Number 131 Issued at 2200Z on 09 May 2024
+    """
+    # :Issued: 2024 May 10 0030 UTC
+    m = re.search(r":Issued:\s*(\d{4})\s+(\w+)\s+(\d{1,2})\s+(\d{4})\s*UTC", text)
+    if m:
+        try:
+            dt = datetime.strptime(
+                f"{m.group(1)} {m.group(2)} {m.group(3)} {m.group(4)}",
+                "%Y %B %d %H%M",
+            )
+            return dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+
+    # SDF Number N Issued at HHMMZ on DD Mon YYYY
+    m = re.search(
+        r"Issued at\s+(\d{2})(\d{2})Z\s+on\s+(\d{1,2})\s+(\w+)\s+(\d{4})",
+        text,
+    )
+    if m:
+        try:
+            dt = datetime.strptime(
+                f"{m.group(5)} {m.group(4)} {m.group(3)} {m.group(1)}{m.group(2)}",
+                "%Y %B %d %H%M",
+            )
+            return dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+
+    # Fallback: конец дня
+    return day.replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
+
+
+def fetch_rsga_archive(
+    start: datetime,
+    end: datetime,
+    *,
+    cutoff: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """SEP-5. NCEI RSGA — ежедневные отчёты и прогнозы.
+
+    Возвращает items: {day, issued, url, text}.
+    Для строгого replay фильтрует по issued <= cutoff.
+    """
+    items: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    urls: List[str] = []
+
+    day = start.replace(hour=0, minute=0, second=0, microsecond=0)
+    while day <= end:
+        url = _rsga_url(day)
+        try:
+            r = session.get(url, timeout=20)
+            if r.status_code == 404:
+                day += timedelta(days=1)
+                continue
+            r.raise_for_status()
+        except Exception as e:
+            errors.append(f"{day.date()}: {type(e).__name__}: {e}")
+            day += timedelta(days=1)
+            continue
+
+        urls.append(url)
+        issued = _parse_rsga_issued(r.text, day)
+        if cutoff and issued and issued > cutoff:
+            # Поздний выпуск, в replay не учитывается
+            day += timedelta(days=1)
+            continue
+
+        items.append({
+            "day": day.date().isoformat(),
+            "issued": _iso_z(issued) if issued else None,
+            "url": url,
+            "text": r.text[:20000],
+        })
+        day += timedelta(days=1)
+
+    items.sort(key=lambda x: x["issued"] or "")
 
     return _envelope(
-        items=items, source="Meteor showers (local)",
-        source_url=str(METEORS_LOCAL),
-        version="static-2026", units="ZHR",
-        error=error, mode="both",
+        items=items, source="NOAA NCEI RSGA",
+        source_url=urls[0] if urls else RSGA_BASE.format(y=start.year, m=start.month),
+        version="RSGA", units="—",
+        publication_time=cutoff,
+        error="; ".join(errors) if errors and not items else None,
+        mode="historical" if cutoff else "current",
         limitations=(
-            "Статистический календарь потоков. Не учитывает реальную плотность пыли; "
-            "не каталог отдельных частиц."
+            "Ежедневный отчёт и прогноз SWPC. Replay — по issued (время выпуска). "
+            "GEOALERT прекращён 2026-05-20; используем только архив."
         ),
     )
 
 
-_METEORS_FALLBACK: List[Dict[str, Any]] = [
-    {"name": "Eta Aquariids", "start": "2024-05-05T00:00:00Z",
-     "end": "2024-05-07T00:00:00Z", "zhr": 50},
-    {"name": "Perseids", "start": "2024-08-11T00:00:00Z",
-     "end": "2024-08-13T00:00:00Z", "zhr": 100},
-    {"name": "Orionids", "start": "2024-10-21T00:00:00Z",
-     "end": "2024-10-22T00:00:00Z", "zhr": 20},
-    {"name": "Leonids", "start": "2024-11-17T00:00:00Z",
-     "end": "2024-11-18T00:00:00Z", "zhr": 15},
-    {"name": "Geminids", "start": "2024-12-13T00:00:00Z",
-     "end": "2024-12-15T00:00:00Z", "zhr": 150},
-]
-
-
 # ===========================================================================
-# 10. Реестр источников и агрегатор
+# Реестр и агрегатор
 # ===========================================================================
 
 def list_registered_sources() -> List[Dict[str, Any]]:
-    """Перечень зарегистрированных источников для /api/sources.
-
-    Поле modes: ['current'], ['historical'] или ['current', 'historical'].
-    """
+    """Реестр в соответствии с Reestr_istochnikov_VKD.xlsx."""
     return [
-        # --- Орбита ---
-        {"id": "tle", "factor": "orbit", "source": "Celestrak GP",
-         "role": "operational TLE", "modes": ["current"], "ttl": 3600},
-        {"id": "tle_history", "factor": "orbit", "source": "Space-Track gp_history",
-         "role": "historical TLE", "modes": ["historical"], "ttl": 86400},
-
-        # --- Сближения ---
-        {"id": "conjunctions", "factor": "conjunction", "source": "Space-Track cdm_public",
-         "role": "conjunctions (historical)", "modes": ["historical"], "ttl": 1800},
-        {"id": "socrates", "factor": "conjunction", "source": "Celestrak SOCRATES",
-         "role": "conjunctions (current, reserve)", "modes": ["current"], "ttl": 3600},
-
-        # --- SEP ---
-        {"id": "sep_goes_archive", "factor": "SEP", "source": "NOAA NCEI GOES",
-         "role": "proton flux (archive)", "modes": ["current", "historical"], "ttl": 86400},
-        {"id": "sep_swpc_protons", "factor": "SEP", "source": "NOAA SWPC",
-         "role": "proton flux (live)", "modes": ["current"], "ttl": 300},
+        # --- SEP (космическая погода: протоны) ---
+        {"id": "SEP-1", "factor": "SEP", "source": "NOAA NCEI GOES SGPS",
+         "role": "архив наблюдений (диф. каналы)", "modes": ["current", "historical"], "ttl": 86400},
+        {"id": "SEP-2", "factor": "SEP", "source": "NOAA SWPC",
+         "role": "оперативные протоны", "modes": ["current"], "ttl": 300},
+        {"id": "SEP-3", "factor": "SEP/G", "source": "NOAA SWPC",
+         "role": "оповещения alerts", "modes": ["current"], "ttl": 300},
+        {"id": "SEP-4", "factor": "SEP/G", "source": "NOAA SWPC",
+         "role": "3-day forecast", "modes": ["current"], "ttl": 3600},
+        {"id": "SEP-5", "factor": "SEP/G", "source": "NOAA NCEI RSGA",
+         "role": "архив сводок и прогнозов (replay)", "modes": ["current", "historical"], "ttl": 86400},
+        {"id": "SEP-6", "factor": "SEP", "source": "NASA DONKI",
+         "role": "каталог событий + notifications", "modes": ["current", "historical"], "ttl": 600},
 
         # --- G (геомагнитные бури) ---
-        {"id": "swpc_kp", "factor": "G", "source": "NOAA SWPC",
-         "role": "Kp nowcast", "modes": ["current"], "ttl": 300},
-        {"id": "swpc_kp_forecast", "factor": "G", "source": "NOAA SWPC",
-         "role": "Kp forecast", "modes": ["current"], "ttl": 900},
-        {"id": "gfz_kp", "factor": "G", "source": "GFZ Potsdam",
-         "role": "Kp (all/def)", "modes": ["current", "historical"], "ttl": 1800},
-        {"id": "donki_gst", "factor": "G", "source": "NASA DONKI",
-         "role": "GST events", "modes": ["current", "historical"], "ttl": 600},
-        {"id": "donki_cme", "factor": "G", "source": "NASA DONKI",
-         "role": "CME arrival forecast", "modes": ["current", "historical"], "ttl": 600},
+        {"id": "G-1", "factor": "G", "source": "GFZ Potsdam",
+         "role": "Kp архив/nowcast", "modes": ["current", "historical"], "ttl": 1800},
+        {"id": "G-2", "factor": "G", "source": "NOAA SWPC",
+         "role": "Kp оперативный", "modes": ["current"], "ttl": 300},
+        {"id": "G-3", "factor": "G", "source": "NOAA SWPC",
+         "role": "Kp прогноз", "modes": ["current"], "ttl": 900},
+        {"id": "G-4", "factor": "G", "source": "NASA DONKI",
+         "role": "CMEAnalysis + GST", "modes": ["current", "historical"], "ttl": 600},
 
-        # --- SEP/G события и алерты ---
-        {"id": "swpc_alerts", "factor": "SEP/G", "source": "NOAA SWPC",
-         "role": "alerts", "modes": ["current"], "ttl": 300},
-        {"id": "swpc_3day", "factor": "SEP/G", "source": "NOAA SWPC",
-         "role": "3-day forecast", "modes": ["current"], "ttl": 3600},
-        {"id": "donki_sep", "factor": "SEP", "source": "NASA DONKI",
-         "role": "SEP events", "modes": ["current", "historical"], "ttl": 600},
-        {"id": "donki_notif", "factor": "SEP/G", "source": "NASA DONKI",
-         "role": "notifications", "modes": ["current", "historical"], "ttl": 600},
+        # --- SAA (орбита) ---
+        {"id": "SAA-1", "factor": "orbit", "source": "Space-Track gp_history",
+         "role": "архив TLE", "modes": ["historical"], "ttl": 86400},
+        {"id": "SAA-2", "factor": "orbit", "source": "CelesTrak GP",
+         "role": "оперативный TLE", "modes": ["current"], "ttl": 7200},
+        {"id": "SAA-3", "factor": "orbit", "source": "SGP4 (расчёт)",
+         "role": "пропагатор", "modes": ["calculation"], "ttl": 0},
+        {"id": "SAA-4", "factor": "orbit", "source": "IGRF-14 (расчёт)",
+         "role": "модель поля", "modes": ["calculation"], "ttl": 0},
 
-        # --- Метеороиды ---
-        {"id": "meteors", "factor": "meteor", "source": "local",
-         "role": "shower calendar", "modes": ["current", "historical"], "ttl": 0},
+        # --- CONJ (сближения) ---
+        {"id": "CONJ-1", "factor": "conjunction", "source": "Space-Track cdm_public",
+         "role": "архив CDM", "modes": ["historical"], "ttl": 1800},
+        {"id": "CONJ-2", "factor": "conjunction", "source": "CelesTrak SOCRATES",
+         "role": "текущие сближения", "modes": ["current"], "ttl": 3600},
+        {"id": "CONJ-3", "factor": "conjunction", "source": "Space-Track cdm_public",
+         "role": "будущие TCA", "modes": ["current"], "ttl": 1800},
+        {"id": "CONJ-4", "factor": "conjunction", "source": "расчёт по GP_HISTORY",
+         "role": "собственный расчёт (replay)", "modes": ["calculation"], "ttl": 0},
     ]
 
 
@@ -1300,19 +1306,16 @@ def collect_for_window(
     include_historical_tle: bool = False,
     include_cdm: bool = True,
     include_sep: bool = True,
-    include_meteors: bool = True,
     include_swpc: bool = True,
     include_donki: bool = True,
     include_gfz: bool = True,
     include_socrates: bool = False,
+    include_rsga: bool = True,
 ) -> Dict[str, Any]:
     """Собирает источники для окна [start, end].
 
-    cutoff задан → исторический режим. В нём автоматически отключаются
-    источники без архива (SWPC live, SOCRATES, CelesTrak GP), даже если
-    флаги включены. Это защита T4 от подмешивания свежих данных.
-
-    Никогда не бросает — ошибки складываются в result["errors"].
+    cutoff задан → historical. Live-only источники (SWPC, SOCRATES,
+    CelesTrak GP) автоматически пропускаются (защита T4).
     """
     is_historical = cutoff is not None
     result: Dict[str, Any] = {
@@ -1336,66 +1339,64 @@ def collect_for_window(
         if env.get("error"):
             result["errors"][name] = env["error"]
 
-    def _skip_live_only(name: str) -> None:
+    def _skip(name: str) -> None:
         result["skipped_live_only"].append(name)
 
-    # --- Орбита ---
+    # --- SAA-1 / SAA-2: орбита ---
     if is_historical:
         if include_historical_tle:
             _try("tle_history", fetch_tle_history, start, end, cutoff=cutoff)
     else:
         _try("tle", fetch_tle_iss)
 
-    # --- Сближения ---
+    # --- CONJ-1 / CONJ-3: сближения ---
     if include_cdm:
-        if is_historical:
-            _try("conjunctions", fetch_conjunctions, start, end, cutoff=cutoff)
-        else:
-            # В current cdm_public тоже работает, но TCA в будущем.
-            _try("conjunctions", fetch_conjunctions, start, end, cutoff=None)
+        _try("conjunctions", fetch_conjunctions, start, end, cutoff=cutoff)
+
+    # --- CONJ-2: SOCRATES (current only) ---
     if include_socrates:
         if is_historical:
-            _skip_live_only("socrates")
+            _skip("socrates")
         else:
             _try("socrates", fetch_socrates)
 
-    # --- SEP ---
+    # --- SEP-1: GOES SGPS (both) ---
     if include_sep:
-        # GOES SGPS: работает в обоих режимах (архив NCEI)
-        _try("sep_goes_archive", fetch_sep_proton_flux, start, end, cutoff=cutoff)
-        # SWPC protons: live only
-        if include_swpc:
-            if is_historical:
-                _skip_live_only("sep_swpc_protons")
-            else:
-                _try("sep_swpc_protons", fetch_swpc_protons)
+        _try("sep_goes_archive", fetch_sep_goes_archive, start, end, cutoff=cutoff)
 
-    # --- SWPC live-only: не вызываем в historical ---
+    # --- SEP-2: SWPC protons (current only) ---
+    if include_sep and include_swpc:
+        if is_historical:
+            _skip("sep_swpc_protons")
+        else:
+            _try("sep_swpc_protons", fetch_swpc_protons)
+
+    # --- SEP-3, SEP-4, G-2, G-3: SWPC live-only ---
     if include_swpc:
         for name, fn in (
-            ("swpc_kp", fetch_swpc_kp),
-            ("swpc_kp_forecast", fetch_swpc_kp_forecast),
-            ("swpc_alerts", fetch_swpc_alerts),
-            ("swpc_3day", fetch_swpc_3day_forecast),
+            ("swpc_alerts", fetch_swpc_alerts),           # SEP-3
+            ("swpc_3day", fetch_swpc_3day_forecast),      # SEP-4
+            ("swpc_kp", fetch_swpc_kp),                   # G-2
+            ("swpc_kp_forecast", fetch_swpc_kp_forecast), # G-3
         ):
             if is_historical:
-                _skip_live_only(name)
+                _skip(name)
             else:
                 _try(name, fn)
 
-    # --- GFZ Kp: работает в обоих режимах ---
+    # --- SEP-5: RSGA (both) ---
+    if include_rsga:
+        _try("rsga", fetch_rsga_archive, start, end, cutoff=cutoff)
+
+    # --- G-1: GFZ Kp (both) ---
     if include_gfz:
         _try("gfz_kp", fetch_gfz_kp, start, end, cutoff=cutoff)
 
-    # --- DONKI: архив, работает в обоих режимах ---
+    # --- SEP-6 / G-4: DONKI (both) ---
     if include_donki:
-        _try("donki_sep", fetch_donki_sep, start, end, cutoff=cutoff)
-        _try("donki_gst", fetch_donki_gst, start, end, cutoff=cutoff)
-        _try("donki_cme", fetch_donki_cmeanalysis, start, end, cutoff=cutoff)
-        _try("donki_notif", fetch_donki_notifications, start, end, cutoff=cutoff)
-
-    # --- Метеороиды: работает в обоих режимах ---
-    if include_meteors:
-        _try("meteors", fetch_meteor_showers)
+        _try("donki_sep", fetch_donki_sep, start, end, cutoff=cutoff)          # SEP-6
+        _try("donki_notif", fetch_donki_notifications, start, end, cutoff=cutoff)  # SEP-6
+        _try("donki_gst", fetch_donki_gst, start, end, cutoff=cutoff)          # G-4
+        _try("donki_cme", fetch_donki_cmeanalysis, start, end, cutoff=cutoff)  # G-4
 
     return result

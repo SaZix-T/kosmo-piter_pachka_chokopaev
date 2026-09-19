@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="container py-4" id="result-root" data-calc-id="{{ calc_id }}">
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <h2 class="text-light mb-0">Расчёт <code>{{ calc_id }}</code></h2>
+    <div>
+      <span class="badge bg-info" id="mode-badge">—</span>
+      <span class="badge bg-secondary" id="algo-version">—</span>
+    </div>
+  </div>
+
+  <div class="glass p-3 mb-3" id="header-block"></div>
+
+  <div class="row g-3">
+    <div class="col-lg-7">
+      <div class="glass p-3 mb-3">
+        <h5 class="text-light">Линии анализа</h5>
+        <div id="lines-block"></div>
+      </div>
+
+      <div class="glass p-3 mb-3">
+        <h5 class="text-light">Окна-кандидаты</h5>
+        <div id="windows-block"></div>
+      </div>
+    </div>
+
+    <div class="col-lg-5">
+      <div class="glass p-3 mb-3">
+        <h5 class="text-light">Рекомендация</h5>
+        <div id="recommendation-block"></div>
+      </div>
+
+      <div class="glass p-3 mb-3">
+        <h5 class="text-light">Предупреждения</h5>
+        <div id="warnings-block"></div>
+      </div>
+
+      <div class="glass p-3 mb-3">
+        <h5 class="text-light">Информационные карточки</h5>
+        <div id="info-block"></div>
+      </div>
+
+      <div class="glass p-3 mb-3">
+        <h5 class="text-light">Источники</h5>
+        <div id="sources-block"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="d-flex gap-2 mt-3">
+    <a class="btn btn-outline-light" id="export-json">Скачать JSON</a>
+    <a class="btn btn-outline-light" id="export-csv">Скачать CSV</a>
+  </div>
+</div>
+<script src="{{ url_for('static', filename='js/result.js') }}"></script>
+{% endblock %}
