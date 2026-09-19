@@ -301,7 +301,7 @@ body {
 
 .compare-row {
   display: grid;
-  grid-template-columns: 60px 1fr 90px 90px 90px 120px;
+  grid-template-columns: minmax(60px, max-content) 1fr 90px 90px 90px 120px;
   align-items: center;
   padding: .7rem .9rem;
   border-radius: var(--radius-sm);
