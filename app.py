@@ -1,10 +1,8 @@
-"""Точка входа: создаёт Flask, подключает SQLite и кэш. Без роутов."""
-from __future__ import annotations
-
 import os
 import sqlite3
+from pathlib import Path
 
-from flask import Flask, g
+from flask import Flask, g, render_template
 from requests_cache import CachedSession
 
 
@@ -17,7 +15,6 @@ def create_app() -> Flask:
     os.makedirs(app.instance_path, exist_ok=True)
     os.makedirs(app.config["CACHE_DIR"], exist_ok=True)
 
-    # --- SQLite --------------------------------------------------------
     def get_db() -> sqlite3.Connection:
         if "db" not in g:
             g.db = sqlite3.connect(app.config["DATABASE"])
@@ -33,6 +30,15 @@ def create_app() -> Flask:
     app.get_db = get_db
     app.teardown_appcontext(close_db)
 
+    # --- pages ---
+    @app.get("/")
+    def index():
+        return render_template("index.html")
+
+    @app.get("/sources")
+    def sources_page():
+        return render_template("sources.html")
+
     return app
 
 
@@ -40,4 +46,4 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=8000, debug=True)
+    app.run(host="0.0.0.0", port=8000, debug=True)

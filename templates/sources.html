@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Источники — Прогнозирование рисков ВКД{% endblock %}
+
+{% block content %}
+<section class="glass glass-section reveal">
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <h3 class="glass-title"><i class="bi bi-hdd-network me-2"></i>Состояние источников</h3>
+    <button class="btn-glass" id="refreshSourcesBtn">
+      <i class="bi bi-arrow-clockwise"></i> Обновить
+    </button>
+  </div>
+
+  <div id="sourcesTableWrap">
+    <div class="empty-state">
+      <i class="bi bi-hourglass-split"></i>
+      Загрузка…
+    </div>
+  </div>
+</section>
+{% endblock %}
