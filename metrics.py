@@ -18,13 +18,12 @@ metrics.py — свод данных источников в линии, окн�
 """
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 
-ALGO_VERSION = "0.3.1"
+ALGO_VERSION = "0.3.2"
 
 
 # ============================================================
@@ -33,10 +32,10 @@ ALGO_VERSION = "0.3.1"
 
 PARAM: Dict[str, Any] = {
     # 5.2 SEP: пороги J10 (pfu) → уровень
-    "sep_s1":     10,     # S1
-    "sep_s2":    100,     # S2
-    "sep_s3":   1000,     # S3+
-    "sep_low":     1,     # ниже S1, но поток повышен
+    "sep_s1":     10,
+    "sep_s2":    100,
+    "sep_s3":   1000,
+    "sep_low":     1,
 
     # 5.2 прогноз SEP
     "sep_decay_hours_lo": 3.0,
@@ -44,23 +43,85 @@ PARAM: Dict[str, Any] = {
     "sep_forecast_horizon_h": 6.0,
 
     # 5.4 радиационная линия
-    "delta_sep_min": 1,   # SEP >= 1
-    "delta_g_min":   2,   # G >= 2
-    "phi_g_min":     3,   # G >= 3
+    "delta_sep_min": 1,
+    "delta_g_min":   2,
+    "phi_g_min":     3,
 
     # 5.6 сближения
     "pc_thresholds": [1e-4, 1e-5, 1e-6],
-    "conj_tca_tolerance_s": 300,   # дедуп: 5 минут
+    "conj_tca_tolerance_s": 300,
 
     # 5.8 сравнение
-    "warning_level_min": 2,        # уровень, с которого считаем "время под угрозой"
+    "warning_level_min": 2,
 
     # 5.7 уверенность
     "conf_low_max":  3,
     "conf_medium_max": 6,
 
     # Baseline-экстраполяция
-    "g_baseline_hours": 3,         # Kp-сегмент длится 3 часа
+    "g_baseline_hours": 3,
+}
+
+
+# ============================================================
+# Словари человекочитаемых названий
+# ============================================================
+
+LINE_TITLES = {
+    "radiation":    "Радиационная обстановка",
+    "conjunctions": "Сближения с космическим мусором",
+    "g_effects":    "Геомагнитная буря (справочно)",
+    "cme_context":  "Выброс корональной массы (контекст)",
+    "saa":          "Южно-Атлантическая аномалия",
+}
+
+MECHANISM_LABELS = {
+    "space_weather": "Космическая погода",
+    "mmod":          "Микрометеороиды и мусор",
+}
+
+KIND_LABELS = {
+    "observation": "Наблюдение",
+    "forecast":    "Прогноз",
+    "calculation": "Расчёт",
+    "mixed":       "Смешанное",
+}
+
+KIND_SHORT = {
+    "observation": "Н",
+    "forecast":    "П",
+    "calculation": "Р",
+    "mixed":       "Σ",
+}
+
+CONFIDENCE_LABELS = {
+    "low":    "Низкая",
+    "medium": "Средняя",
+    "high":   "Высокая",
+    "nd":     "Не определена",
+}
+
+LEVEL_SHORT = {
+    0: "Спокойно",
+    1: "Слабо",
+    2: "Умеренно",
+    3: "Сильно",
+    4: "Экстремально",
+}
+
+SEVERITY_LABELS = {
+    "info":     "Информация",
+    "minor":    "Незначительно",
+    "major":    "Серьёзно",
+    "critical": "Критично",
+}
+
+OUTCOME_LABELS = {
+    "recommended":  "Рекомендуется",
+    "equivalent":   "Равнозначные окна",
+    "insufficient": "Недостаточно данных",
+    "single":       "Единственное окно",
+    "no_threats":   "Угроз не обнаружено",
 }
 
 
@@ -93,8 +154,13 @@ class Segment:
     def to_dict(self) -> dict:
         return {
             "start": _iso(self.start), "end": _iso(self.end),
-            "level": self.level, "kind": self.kind,
-            "source": self.source, "note": self.note,
+            "level": self.level,
+            "level_label": LEVEL_SHORT.get(self.level, f"Уровень {self.level}"),
+            "kind": self.kind,
+            "kind_label": KIND_LABELS.get(self.kind, self.kind),
+            "kind_short": KIND_SHORT.get(self.kind, "?"),
+            "source": self.source,
+            "note": self.note,
         }
 
 
@@ -103,15 +169,15 @@ class Line:
     """Одна линия анализа.
 
     contributes=True  — учитывается в окнах и рекомендации.
-    contributes=False — информационная карточка (G-эффекты, CME).
+    contributes=False — информационная карточка.
     """
     name: str
     mechanism: str
     contributes: bool
-    level_lo: Optional[int]     # None = ND
+    level_lo: Optional[int]
     level_hi: Optional[int]
-    confidence: str             # low / medium / high / nd
-    kind: str                   # observation / forecast / calculation / mixed
+    confidence: str
+    kind: str
     sources: List[str] = field(default_factory=list)
     limitations: str = ""
     note: Optional[str] = None
@@ -124,13 +190,20 @@ class Line:
     def to_dict(self) -> dict:
         return {
             "name": self.name,
+            "title": LINE_TITLES.get(self.name, self.name),
+            "summary": _line_summary(self),
             "mechanism": self.mechanism,
+            "mechanism_label": MECHANISM_LABELS.get(self.mechanism, self.mechanism),
             "contributes": self.contributes,
             "level_lo": self.level_lo,
             "level_hi": self.level_hi,
+            "level_label": _level_label(self.level_lo, self.level_hi, self.is_nd),
             "is_nd": self.is_nd,
             "confidence": self.confidence,
+            "confidence_label": CONFIDENCE_LABELS.get(self.confidence, self.confidence),
             "kind": self.kind,
+            "kind_label": KIND_LABELS.get(self.kind, self.kind),
+            "kind_short": KIND_SHORT.get(self.kind, "?"),
             "sources": list(self.sources),
             "limitations": self.limitations,
             "note": self.note,
@@ -140,10 +213,9 @@ class Line:
 
 @dataclass
 class Warning:
-    """Отдельное предупреждение для UI."""
     source: str
     kind: str
-    severity: str               # info / minor / major / critical
+    severity: str
     label: str
     start: datetime
     end: datetime
@@ -156,8 +228,13 @@ class Warning:
 
     def to_dict(self) -> dict:
         return {
-            "source": self.source, "kind": self.kind,
-            "severity": self.severity, "label": self.label,
+            "source": self.source,
+            "kind": self.kind,
+            "kind_label": KIND_LABELS.get(self.kind, self.kind),
+            "kind_short": KIND_SHORT.get(self.kind, "?"),
+            "severity": self.severity,
+            "severity_label": SEVERITY_LABELS.get(self.severity, self.severity),
+            "label": self.label,
             "start": _iso(self.start), "end": _iso(self.end),
             "value": self.value, "unit": self.unit,
             "publication_time": _iso(self.publication_time) if self.publication_time else None,
@@ -188,8 +265,11 @@ class WindowResult:
             "duration_minutes": self.duration_minutes,
             "peak_level_lo": self.peak_level_lo,
             "peak_level_hi": self.peak_level_hi,
+            "peak_level_label": _level_label(
+                self.peak_level_lo, self.peak_level_hi, False),
             "minutes_at_warning": self.minutes_at_warning,
             "confidence": self.confidence,
+            "confidence_label": CONFIDENCE_LABELS.get(self.confidence, self.confidence),
             "lines": [l.to_dict() for l in self.lines],
             "warnings": [w.to_dict() for w in self.warnings],
             "plan_change": self.plan_change,
@@ -215,6 +295,7 @@ class AnalysisResult:
     def to_dict(self) -> dict:
         return {
             "mode": self.mode,
+            "mode_label": "Исторический" if self.mode == "historical" else "Текущий",
             "cutoff": _iso(self.cutoff) if self.cutoff else None,
             "start": _iso(self.start), "end": _iso(self.end),
             "lines_global": [l.to_dict() for l in self.lines_global],
@@ -240,15 +321,39 @@ def _iso(x: Optional[datetime]) -> Optional[str]:
 
 
 def _parse_iso(s: Optional[str]) -> Optional[datetime]:
+    """Универсальный парсер даты.
+
+    Поддерживает ISO 8601, SOCRATES-формат и SWPC-формат без tz.
+    """
     if not s:
         return None
-    try:
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        d = datetime.fromisoformat(s)
-        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
-    except Exception:
+    s = str(s).strip()
+    if not s:
         return None
+
+    try:
+        cand = s
+        if cand.endswith("Z"):
+            cand = cand[:-1] + "+00:00"
+        d = datetime.fromisoformat(cand)
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+
+    for fmt in (
+        "%Y %b %d %H:%M:%S.%f",
+        "%Y %b %d %H:%M:%S",
+        "%Y %b %d %H:%M",
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%b-%d %H:%M:%S",
+    ):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
 
 
 def _overlap(a1: datetime, a2: datetime, b1: datetime, b2: datetime) -> bool:
@@ -267,7 +372,6 @@ def _level_at(segments: List[Segment], t: datetime) -> int:
 
 
 def _merge_minutes(intervals: List[Tuple[datetime, datetime]]) -> int:
-    """Объединение интервалов, сумма минут (без двойного счёта)."""
     if not intervals:
         return 0
     intervals = sorted(intervals)
@@ -282,11 +386,7 @@ def _merge_minutes(intervals: List[Tuple[datetime, datetime]]) -> int:
 
 
 def _best_env(*envs: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Возвращает первый envelope с непустыми items; иначе первый без error; иначе первый.
-
-    Нужно, потому что `a or b` берёт первый truthy dict, даже если у него
-    items=[] (например, GOES SGPS за свежую дату, где архив ещё не вышел).
-    """
+    """Первый envelope с непустыми items; иначе первый без error; иначе первый."""
     non_empty = [e for e in envs if e and (e.get("items") or [])]
     if non_empty:
         return non_empty[0]
@@ -294,6 +394,73 @@ def _best_env(*envs: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if non_error:
         return non_error[0]
     return next((e for e in envs if e), None)
+
+
+def _level_label(lo: Optional[int], hi: Optional[int], is_nd: bool) -> str:
+    if is_nd or lo is None or hi is None:
+        return "Нет данных"
+    if lo == hi:
+        return LEVEL_SHORT.get(lo, f"Уровень {lo}")
+    lo_s = LEVEL_SHORT.get(lo, f"{lo}")
+    hi_s = LEVEL_SHORT.get(hi, f"{hi}")
+    return f"От «{lo_s.lower()}» до «{hi_s.lower()}»"
+
+
+def _line_summary(line: "Line") -> str:
+    """Короткое человекочитаемое описание состояния линии."""
+    name = line.name
+
+    if name == "radiation":
+        if line.is_nd:
+            return ("Нет свежих данных о радиации и нет предупреждений "
+                    "от NOAA. Оценить радиационную обстановку нельзя.")
+        hi = line.level_hi or 0
+        if hi == 0:
+            return "Поток протонов в норме, геомагнитный фон спокойный."
+        if hi == 1:
+            return ("Незначительное радиационное воздействие — поток "
+                    "протонов слегка повышен или активна слабая буря.")
+        if hi == 2:
+            return "Умеренный радиационный риск. Работы возможны с оговорками."
+        if hi == 3:
+            return "Сильный радиационный риск. ВКД в этом окне нежелательна."
+        return ("Экстремальный радиационный риск. Проводить ВКД в этом "
+                "окне опасно.")
+
+    if name == "conjunctions":
+        if line.is_nd:
+            return ("Сближения не проверены — источник недоступен. "
+                    "Отсутствие данных не означает отсутствие угроз.")
+        if (line.level_hi or 0) == 0:
+            return ("Сближений с отслеживаемыми объектами на опасное "
+                    "расстояние в окне нет.")
+        return ("Обнаружены сближения с объектами. Смотрите детали "
+                "ниже — там вероятность и дистанция.")
+
+    if name == "g_effects":
+        if line.is_nd:
+            return "Данные о геомагнитной активности отсутствуют."
+        return (f"Зафиксирована геомагнитная буря уровня G{line.level_hi}. "
+                "Собственные эффекты (зарядка, торможение) справочно, "
+                "в расчёт окна не идут.")
+
+    if name == "cme_context":
+        if line.is_nd:
+            return ("Прогнозов прихода CME нет. Ожидать магнитных "
+                    "возмущений не следует.")
+        return ("Модель WSA-ENLIL оценивает приход выброса корональной "
+                "массы. Точное время неизвестно — интервал ±7 часов.")
+
+    if name == "saa":
+        return ("Расчёт Южно-Атлантической аномалии пока не реализован — "
+                "нужна модель магнитного поля IGRF-14 и пропагатор SGP4.")
+
+    return ""
+
+
+def _segment_summary(seg: "Segment") -> str:
+    lvl = LEVEL_SHORT.get(seg.level, f"Уровень {seg.level}")
+    return f"{lvl}: {seg.note or seg.source}"
 
 
 # ============================================================
@@ -304,7 +471,7 @@ def kp_to_g(kp: Optional[float]) -> Optional[int]:
     """Kp → уровень G (0..5). Округление до целого (третьи).
 
     0 = нет G-события (Kp < 5). None = данных нет.
-    Особый случай: 9- (≈ 8.67) даёт G4, не G5. G5 только при 9o (>= 9.0).
+    Особый случай: 9- (≈ 8.67) даёт G4, не G5.
     """
     if kp is None:
         return None
@@ -313,7 +480,7 @@ def kp_to_g(kp: Optional[float]) -> Optional[int]:
     if kp >= 9.0:
         return 5
     rounded = int(round(kp))
-    if rounded == 9 and kp < 9.0:   # 9-
+    if rounded == 9 and kp < 9.0:
         return 4
     if rounded >= 8:
         return 4
@@ -321,7 +488,7 @@ def kp_to_g(kp: Optional[float]) -> Optional[int]:
         return 3
     if rounded == 6:
         return 2
-    return 1   # rounded == 5
+    return 1
 
 
 # ============================================================
@@ -333,7 +500,7 @@ def sep_level(j10: Optional[float], *, warning: bool = False) -> Optional[int]:
     if j10 is None and not warning:
         return None
     if j10 is None:
-        return 1   # предупреждение SWPC — минимум 1 (эвристика 6.1 № 3)
+        return 1
     if j10 >= PARAM["sep_s3"]:
         return 4
     if j10 >= PARAM["sep_s2"]:
@@ -355,9 +522,7 @@ def build_sep_segments(
 ) -> List[Segment]:
     """Точки потока → сегменты по 5 минут.
 
-    Если в окне нет точек, берём последнюю точку до w_start и
-    экстраполируем на forecast_hours (см. §5.2 — спад exp(-t/τ),
-    верхняя граница).
+    Baseline: последняя точка до w_start + экстраполяция на forecast_hours.
     """
     if not env or env.get("error") or not env.get("items"):
         return []
@@ -370,7 +535,6 @@ def build_sep_segments(
     src = env.get("source", "SEP")
     segs: List[Segment] = []
 
-    # --- baseline: последняя точка <= w_start
     baseline = None
     for p in points:
         t = _parse_iso(p.get("time_utc"))
@@ -400,7 +564,6 @@ def build_sep_segments(
                     level=lvl, kind=KIND_FCST, source=src, note=note,
                 ))
 
-    # --- точки внутри окна
     for p in points:
         t = _parse_iso(p.get("time_utc"))
         if t is None or t < w_start or t > w_end:
@@ -433,14 +596,7 @@ def build_g_segments(
     forecast: bool = False,
     baseline_hours: int = 3,
 ) -> List[Segment]:
-    """Kp-точки → сегменты по 3 часа.
-
-    Если точек внутри окна нет, но есть последняя точка до w_start —
-    создаём baseline-сегмент от w_start на 3 часа.
-
-    forecast=True  → только observed=False (будущие точки).
-    forecast=False → только observed=True или без поля (наблюдения).
-    """
+    """Kp-точки → сегменты по 3 часа с baseline."""
     if not env or env.get("error") or not env.get("items"):
         return []
 
@@ -450,7 +606,6 @@ def build_g_segments(
 
     for p in env["items"]:
         if forecast:
-            # forecast: только observed=False; если поля нет — считаем наблюдением
             if p.get("observed", True):
                 continue
         else:
@@ -467,7 +622,6 @@ def build_g_segments(
     all_pts.sort(key=lambda x: x[0])
     segs: List[Segment] = []
 
-    # --- baseline: последняя точка <= w_start
     baseline = None
     for t, p in all_pts:
         if t <= w_start:
@@ -489,7 +643,6 @@ def build_g_segments(
                     note=f"baseline Kp={float(kp_val):.2f} → G{g}",
                 ))
 
-    # --- точки внутри окна
     for t, p in all_pts:
         if t < w_start or t > w_end:
             continue
@@ -503,7 +656,6 @@ def build_g_segments(
             note=f"Kp={float(kp_val):.2f} → G{g}",
         ))
 
-    # --- дедуп пересечений: baseline + первая точка могут наложиться
     if not segs:
         return []
     merged: List[Segment] = [segs[0]]
@@ -531,12 +683,7 @@ def build_radiation_line(
     g_is_nd: bool,
     sample_min: int = 5,
 ) -> Line:
-    """Собирает радиационную линию из SEP и G по формуле 5.4.
-
-    L(t) = min(4, max(SEP(t) + δ(t), φ(t)))
-      δ = 1, если SEP ≥ 1 и G ≥ 2
-      φ = 1, если G ≥ 3 и SEP = 0
-    """
+    """Радиационная линия: L(t) = min(4, max(SEP(t) + δ(t), φ(t)))."""
     if sep_is_nd:
         return Line(
             name="radiation", mechanism=MECH_SW, contributes=True,
@@ -559,7 +706,6 @@ def build_radiation_line(
             segments=sep_segs,
         )
 
-    # Оба известны — сэмплируем и склеиваем сегменты по изменению уровня
     rad_segs: List[Segment] = []
     cur: Optional[Segment] = None
     t = w_start
@@ -622,10 +768,7 @@ def build_conjunctions_line(
     w_start: datetime,
     w_end: datetime,
 ) -> Line:
-    """L = 1 + число превышенных порогов из {1e-4, 1e-5, 1e-6}.
-
-    P_окна = 1 - Π(1 - Pc_i). Дедуп по (объект, TCA) ± 5 мин.
-    """
+    """L = 1 + число превышенных порогов из {1e-4, 1e-5, 1e-6}."""
     if not env or env.get("error"):
         return Line(
             name="conjunctions", mechanism=MECH_MMOD, contributes=True,
@@ -643,12 +786,10 @@ def build_conjunctions_line(
     items = env.get("items") or []
     src = env.get("source", "conjunctions")
 
-    # Фильтр по TCA внутри окна
     in_win = [c for c in items
               if (_parse_iso(c.get("tca")) is not None
                   and w_start <= _parse_iso(c.get("tca")) <= w_end)]
 
-    # Дедуп по (объект, TCA ± 5 мин)
     tol = timedelta(seconds=PARAM["conj_tca_tolerance_s"])
     seen: List[Tuple[str, datetime]] = []
     uniq: List[Dict[str, Any]] = []
@@ -707,11 +848,10 @@ def build_conjunctions_line(
 
 
 # ============================================================
-# Информационные карточки (без вклада в сумму)
+# Информационные карточки
 # ============================================================
 
 def build_g_effects_card(g_segs: List[Segment]) -> Line:
-    """Собственные эффекты G (зарядка, торможение) — только справочно."""
     if not g_segs:
         return Line(
             name="g_effects", mechanism=MECH_SW, contributes=False,
@@ -733,7 +873,6 @@ def build_g_effects_card(g_segs: List[Segment]) -> Line:
 
 
 def build_cme_context_card(env: Optional[Dict[str, Any]]) -> Line:
-    """CMEAnalysis — входной сигнал, не даёт уровень (5.2, 4.2)."""
     if not env or env.get("error") or not env.get("items"):
         return Line(
             name="cme_context", mechanism=MECH_SW, contributes=False,
@@ -767,11 +906,6 @@ def build_cme_context_card(env: Optional[Dict[str, Any]]) -> Line:
 
 
 def build_saa_stub() -> Line:
-    """SAA — заглушка, пока SGP4/IGRF-14 не подключены.
-
-    Возвращает ND с честной причиной, чтобы фактор можно было отключить
-    без переделки остального (см. FACTORS_AND_MODEL §2).
-    """
     return Line(
         name="saa", mechanism=MECH_SW, contributes=False,
         level_lo=None, level_hi=None,
@@ -806,7 +940,7 @@ def min_confidence(*cs: str) -> str:
 
 
 # ============================================================
-# 5.8 Окна и сравнение
+# 5.8 Окна
 # ============================================================
 
 def _line_for_window(line: Line, w_start: datetime, w_end: datetime) -> Line:
@@ -836,7 +970,6 @@ def _line_for_window(line: Line, w_start: datetime, w_end: datetime) -> Line:
 def _minutes_at_or_above(lines: List[Line],
                          w_start: datetime, w_end: datetime,
                          threshold: int) -> int:
-    """Объединение сегментов уровня ≥ threshold по всем линиям (И5)."""
     intervals: List[Tuple[datetime, datetime]] = []
     for line in lines:
         if not line.contributes:
@@ -899,15 +1032,12 @@ def pick_recommendation(
     windows: List[WindowResult],
     lines_global: Optional[List[Line]] = None,
 ) -> Optional[dict]:
-    """Пик → время под угрозой → уверенность (5.8).
-
-    Исходы: recommended / equivalent / insufficient / single / no_threats.
-    ND-линии не превращаются в 0 (И1).
+    """Пик → время под угрозой → уверенность. Исходы: recommended /
+    equivalent / insufficient / single / no_threats.
     """
     if not windows:
         return None
 
-    # ND-проверка: не выдумывать числа, если данных нет
     if lines_global is not None:
         contributing = [l for l in lines_global if l.contributes]
         if contributing and all(l.is_nd for l in contributing):
@@ -915,17 +1045,19 @@ def pick_recommendation(
                 "window_id": None,
                 "start": None, "end": None,
                 "outcome": "insufficient",
+                "outcome_label": OUTCOME_LABELS["insufficient"],
                 "reason": (
                     "все contributing-линии в состоянии ND — "
                     "данных для сравнения окон нет (И1)"
                 ),
                 "peak_level_lo": None,
                 "peak_level_hi": None,
+                "peak_level_label": "Нет данных",
                 "minutes_at_warning": None,
                 "confidence": "nd",
+                "confidence_label": CONFIDENCE_LABELS["nd"],
             }
 
-    # Все окна без значимых угроз — исход no_threats
     all_clean = all(
         (w.peak_level_hi or 0) == 0 and (w.minutes_at_warning or 0) == 0
         for w in windows
@@ -936,13 +1068,16 @@ def pick_recommendation(
             "window_id": best.id,
             "start": _iso(best.start), "end": _iso(best.end),
             "outcome": "no_threats",
+            "outcome_label": OUTCOME_LABELS["no_threats"],
             "reason": (
                 "во всех окнах значимых угроз не обнаружено; "
                 "выбор ближайшего по времени — по удобству, не по обстановке (5.8)"
             ),
             "peak_level_lo": 0, "peak_level_hi": 0,
+            "peak_level_label": LEVEL_SHORT[0],
             "minutes_at_warning": 0,
             "confidence": best.confidence,
+            "confidence_label": CONFIDENCE_LABELS.get(best.confidence, best.confidence),
         }
 
     sorted_ws = sorted(
@@ -957,11 +1092,15 @@ def pick_recommendation(
             "window_id": best.id,
             "start": _iso(best.start), "end": _iso(best.end),
             "outcome": "single",
+            "outcome_label": OUTCOME_LABELS["single"],
             "reason": "единственное окно в периоде поиска",
             "peak_level_lo": best.peak_level_lo,
             "peak_level_hi": best.peak_level_hi,
+            "peak_level_label": _level_label(
+                best.peak_level_lo, best.peak_level_hi, False),
             "minutes_at_warning": best.minutes_at_warning,
             "confidence": best.confidence,
+            "confidence_label": CONFIDENCE_LABELS.get(best.confidence, best.confidence),
         }
 
     overlap = not (
@@ -998,11 +1137,15 @@ def pick_recommendation(
         "window_id": best.id,
         "start": _iso(best.start), "end": _iso(best.end),
         "outcome": outcome,
+        "outcome_label": OUTCOME_LABELS.get(outcome, outcome),
         "reason": reason,
         "peak_level_lo": best.peak_level_lo,
         "peak_level_hi": best.peak_level_hi,
+        "peak_level_label": _level_label(
+            best.peak_level_lo, best.peak_level_hi, False),
         "minutes_at_warning": best.minutes_at_warning,
         "confidence": best.confidence,
+        "confidence_label": CONFIDENCE_LABELS.get(best.confidence, best.confidence),
     }
 
 
@@ -1024,10 +1167,10 @@ def _collect_warnings(
                 source=s.source, kind=s.kind,
                 severity=("critical" if s.level >= 4
                           else "major" if s.level == 3 else "minor"),
-                label=f"SEP уровень {s.level}",
+                label=f"Радиация: уровень {s.level}",
                 start=s.start, end=s.end,
                 unit="pfu", limitations=s.note,
-                rule="SEP J10 ≥ 10 pfu (5.2)",
+                rule="J10 ≥ 10 pfu → уровень 2 (шкала NOAA S)",
             ))
 
     for s in g_segs:
@@ -1035,7 +1178,7 @@ def _collect_warnings(
             out.append(Warning(
                 source=s.source, kind=s.kind,
                 severity=("critical" if s.level >= 4 else "minor"),
-                label=f"G{s.level}",
+                label=f"Геомагнитная буря G{s.level}",
                 start=s.start, end=s.end,
                 unit="Kp", limitations=s.note,
                 rule="Kp → G по таблице 5.3",
@@ -1046,10 +1189,10 @@ def _collect_warnings(
             out.append(Warning(
                 source=s.source, kind=s.kind,
                 severity="minor",
-                label=s.note or "сближение",
+                label=s.note or "Сближение с объектом",
                 start=s.start, end=s.end,
                 unit="Pc",
-                rule="Pc ≥ 1e-6 (5.6)",
+                rule="Pc ≥ 1e-6 → уровень 1 (5.6)",
             ))
 
     if alerts_env and not alerts_env.get("error") and alerts_env.get("items"):
@@ -1059,9 +1202,9 @@ def _collect_warnings(
             if valid_from is None:
                 continue
             msg = (a.get("message") or "").strip().splitlines()
-            label = next((ln for ln in msg if ln.strip()), "SWPC alert")[:120]
+            label = next((ln for ln in msg if ln.strip()), "Оповещение NOAA")[:120]
             out.append(Warning(
-                source=alerts_env.get("source", "SWPC alerts"),
+                source=alerts_env.get("source", "NOAA SWPC"),
                 kind=KIND_FCST,
                 severity="info",
                 label=label,
@@ -1069,8 +1212,8 @@ def _collect_warnings(
                 end=valid_to or valid_from + timedelta(hours=6),
                 publication_time=_parse_iso(a.get("issued")),
                 validity_end=valid_to,
-                limitations="SWPC alert; три времени хранятся раздельно (И3)",
-                rule="SWPC alert → SEP ≥ 1 (6.1 № 3)",
+                limitations="Оповещение SWPC; три времени хранятся раздельно (И3)",
+                rule="Оповещение SWPC → SEP ≥ 1",
             ))
     return out
 
@@ -1087,15 +1230,12 @@ def analyze(
     duration_hours: int = 6,
     cutoff: Optional[datetime] = None,
 ) -> AnalysisResult:
-    """Строит линии, окна и рекомендацию по данным sources.collect_for_window.
-    """
+    """Строит линии, окна и рекомендацию по данным sources.collect_for_window."""
     mode = data.get("mode") or ("historical" if cutoff else "current")
     errors = dict(data.get("errors") or {})
     skipped = list(data.get("skipped_live_only") or [])
 
-    # ----------------------------------------------------------
     # 1. Выбор актуальных envelope
-    # ----------------------------------------------------------
     sep_env = _best_env(
         data.get("sep_goes_archive"),
         data.get("sep_swpc_protons"),
@@ -1118,88 +1258,65 @@ def analyze(
         data.get("socrates"),
     )
 
-    # ----------------------------------------------------------
     # 2. Сегменты SEP и G
-    # ----------------------------------------------------------
     sep_segs = build_sep_segments(
         sep_env, start, end,
         warning_active=warning_active,
     )
 
-    # warning без точек — синтезируем уровень 1 на всё окно (6.1 № 3)
     if warning_active and not sep_segs:
         sep_segs = [Segment(
             start=start, end=end,
             level=1,
             kind=KIND_FCST,
-            source=(alerts_env.get("source") if alerts_env else "SWPC alerts"),
-            note="warning активен — уровень 1 (эвристика 6.1 № 3)",
+            source=(alerts_env.get("source") if alerts_env else "NOAA SWPC"),
+            note="активно оповещение — уровень 1 (эвристика 6.1 № 3)",
         )]
 
-    # SEP ND — только если источник упал и warning не активен
     sep_source_ok = sep_env is not None and sep_env.get("error") is None
-    sep_is_nd = (
-        not sep_source_ok
-        and not warning_active
-    )
+    sep_is_nd = (not sep_source_ok and not warning_active)
 
     g_obs = build_g_segments(kp_env_obs, start, end, forecast=False)
     g_fc = build_g_segments(kp_env_fc, start, end, forecast=True)
     g_segs = g_obs + g_fc
 
-    # G ND — только если оба источника упали
     g_source_ok = (
         (kp_env_obs is not None and kp_env_obs.get("error") is None)
         or (kp_env_fc is not None and kp_env_fc.get("error") is None)
     )
     g_is_nd = not g_source_ok
 
-    # ----------------------------------------------------------
     # 3. Contributing линии
-    # ----------------------------------------------------------
     radiation = build_radiation_line(
         sep_segs, g_segs, start, end,
         sep_is_nd=sep_is_nd,
         g_is_nd=g_is_nd,
     )
-
     conjunctions = build_conjunctions_line(conj_env, start, end)
-
     saa = build_saa_stub()
 
-    lines_global: List[Line] = [
-        radiation,
-        conjunctions,
-    ]
+    lines_global: List[Line] = [radiation, conjunctions]
 
-    # ----------------------------------------------------------
     # 4. Информационные карточки
-    # ----------------------------------------------------------
     info_cards: List[Line] = [
         build_g_effects_card(g_segs),
         build_cme_context_card(data.get("donki_cme")),
         saa,
     ]
 
-    # ----------------------------------------------------------
     # 5. Warnings
-    # ----------------------------------------------------------
     warnings = _collect_warnings(
         sep_segs, g_segs, conjunctions, alerts_env,
     )
 
-    # ----------------------------------------------------------
     # 6. Окна и рекомендация
-    # ----------------------------------------------------------
     windows = analyze_windows(
         start, end, duration_hours,
         lines_global, warnings,
     )
     recommendation = pick_recommendation(windows, lines_global)
 
-    # ----------------------------------------------------------
     # 7. Статус источников
-    # ----------------------------------------------------------
     sources_status: Dict[str, Any] = {}
     for key, env in data.items():
         if key in ("window", "errors", "mode", "cutoff", "skipped_live_only"):

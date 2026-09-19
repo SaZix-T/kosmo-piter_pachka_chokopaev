@@ -10,7 +10,6 @@ import diskcache
 from flask import Flask, jsonify, render_template, request, Response
 
 from metrics import analyze as metrics_analyze, ALGO_VERSION
-from timelines import iso_z, parse_dt
 
 import sources
 
@@ -39,6 +38,17 @@ def create_app() -> Flask:
 def _iso_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
+def parse_dt(s) -> datetime:
+    """Парсит дату из формы."""
+    if s is None:
+        return None
+    if isinstance(s, datetime):
+        return s if s.tzinfo else s.replace(tzinfo=timezone.utc)
+    s = str(s).strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    d = datetime.fromisoformat(s)
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -118,6 +128,72 @@ def register_routes(app: Flask) -> None:
         return jsonify(payload)
 
     # --- get / list / export ---
+
+    @app.get("/api/iss-track/<calc_id>")
+    def iss_track(calc_id: str):
+        row = app.calcs.get(calc_id)
+        if not row:
+            return jsonify({"error": "Расчёт не найден"}), 404
+
+        # TLE: из sources_status.tle или tle_history
+        tle_env = row.get("sources_status", {}).get("tle") or \
+                row.get("sources_status", {}).get("tle_history")
+        if not tle_env:
+            return jsonify({"error": "TLE не найден в расчёте"}), 400
+
+        # Достаём TLE из envelope → items[0]
+        # sources_status не хранит items. Поэтому пойдём в кэш через sources.
+        import sources
+        tle_items = None
+        try:
+            env = sources.fetch_tle_iss()
+            tle_items = env.get("items") or []
+        except Exception:
+            pass
+
+        if not tle_items:
+            # fallback: пробуем исторический
+            env = sources.fetch_tle_history(
+                parse_dt(row["start"]),
+                parse_dt(row["end"]),
+            )
+            tle_items = env.get("items") or []
+
+        if not tle_items:
+            return jsonify({"error": "TLE недоступен для расчёта"}), 503
+
+        item = tle_items[0]
+        line1 = item.get("line1")
+        line2 = item.get("line2")
+
+        if not (line1 and line2):
+            return jsonify({"error": "TLE без line1/line2"}), 500
+
+        from orbit import iss_position, iss_track
+
+        start = parse_dt(row["start"])
+        end = parse_dt(row["end"])
+        rec = row.get("recommendation") or {}
+        focus_iso = rec.get("start") or row["start"]
+        focus = parse_dt(focus_iso)
+
+        try:
+            position = iss_position(line1, line2, focus)
+            track = iss_track(line1, line2, start, end, step_seconds=90)
+        except Exception as e:
+            return jsonify({"error": f"Ошибка расчёта орбиты: {e}"}), 500
+
+        return jsonify({
+            "tle_epoch": item.get("epoch_utc"),
+            "tle_source": tle_env.get("source"),
+            "focus": position,
+            "track": track,
+            "focus_window": {
+                "start": row["start"], "end": row["end"],
+            },
+        })
+
+    # ---
 
     @app.get("/api/analyze/<calc_id>")
     def analyze_get(calc_id: str):
