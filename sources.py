@@ -44,44 +44,23 @@ except ImportError:
     _HAS_NETCDF = False
 
 
-# ---------------------------------------------------------------------------
-# Cache with dynamic TTL
-# ---------------------------------------------------------------------------
-
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Карта TTL по паттернам URL. Используется в _dynamic_ttl().
-# Первое совпадение выигрывает.
-_TTL_MAP: List[tuple[str, int]] = [
-    # Celestrak TLE обновляется раз в несколько часов
-    ("https://celestrak.org/NORAD/elements/", 3600),
-    # gp_history — архив, можно кэшировать долго
-    ("https://www.space-track.org/basicspacedata/query/class/gp_history", 86400),
-    # cdm_public — обновляется часто
-    ("https://www.space-track.org/basicspacedata/query/class/cdm_public", 1800),
-    # NetCDF GOES — статика
-    ("https://data.ngdc.noaa.gov/platforms/solar-space-observing-satellites/", 86400),
-    # NOAA SWPC
-    ("https://services.swpc.noaa.gov/", 300),
-    # NASA DONKI
-    ("https://api.nasa.gov/DONKI/", 600),
-]
-
-
-def _dynamic_ttl(request) -> int:
-    """Callback для requests_cache: возвращает TTL в секундах по URL."""
-    url = request.url
-    for pattern, ttl in _TTL_MAP:
-        if pattern in url:
-            return ttl
-    return 600  # default
-
+_URLS_EXPIRE: Dict[str, int] = {
+    "https://celestrak.org/NORAD/elements/": 3600,
+    "https://www.space-track.org/basicspacedata/query/class/gp_history": 86400,
+    "https://www.space-track.org/basicspacedata/query/class/cdm_public": 1800,
+    "https://data.ngdc.noaa.gov/platforms/solar-space-observing-satellites/": 86400,
+    "https://services.swpc.noaa.gov/": 300,
+    "https://api.nasa.gov/DONKI/": 600,
+}
 
 session = CachedSession(
     cache_name=str(CACHE_DIR / "http_cache"),
     backend="sqlite",
-    expire_after=_dynamic_ttl,
+    expire_after=600,
+    urls_expire_after=_URLS_EXPIRE,
     allowable_methods=("GET", "POST"),
     stale_if_error=True,
 )
@@ -390,7 +369,7 @@ def fetch_sep_proton_flux(
     end: datetime,
     *,
     cutoff: Optional[datetime] = None,
-    sat: str = "16",
+    sat: str = "19",
     channels: Iterable[str] = ("P7",),
     include_integral: bool = True,
 ) -> Dict[str, Any]:
@@ -412,7 +391,7 @@ def fetch_sep_proton_flux(
 
     day = start.replace(hour=0, minute=0, second=0, microsecond=0)
     while day <= end:
-        fname = f"sci_sgps-l2-avg5m_g{sat}_d{day.strftime('%Y%m%d')}_v3-0-2.nc"
+        fname = f"sci_sgps-l2-avg5m_g{sat}_d{day.strftime('%Y%m%d')}_v3-0-3.nc"
         url = GOES_BASE.format(sat=sat, y=day.year, m=day.month) + fname
 
         try:
@@ -473,7 +452,7 @@ def fetch_sep_proton_flux(
     return _envelope(
         items=items, source="NOAA GOES SEP",
         source_url=urls[0] if urls else GOES_BASE.format(sat=sat, y=start.year, m=start.month),
-        version="sgps-l2-avg5m v3-0-2", units="pfu (protons/cm^2 s sr)",
+        version="sgps-l2-avg5m v3-0-3", units="pfu (protons/cm^2 s sr)",
         publication_time=cutoff,
         error=error_msg,
         limitations=(
@@ -541,15 +520,26 @@ def _resolve_channel_index(wanted: str, channel_names: List[str]) -> Optional[in
 
 
 def _read_goes_time(ds) -> List[datetime]:
-    """L2_SciData_TimeStamp — double-массив.
+    """L2_SciData_TimeStamp или time — double-массив.
 
-    Поддерживает два варианта units:
-      - cftime-совместимые (например, 'seconds since 2000-01-01 12:00:00')
-      - POSIX-секунды (epoch 1970-01-01 UTC), если units отсутствует.
+    Поддерживает cftime-совместимые units (например, 'seconds since 2000-01-01 12:00:00')
+    и POSIX-секунды (epoch 1970-01-01 UTC), если units отсутствует.
     """
-    var = ds["L2_SciData_TimeStamp"]
+    # Пробуем разные имена переменной времени
+    var = None
+    for name in ("L2_SciData_TimeStamp", "time"):
+        if name in ds.variables:
+            var = ds[name]
+            break
+    if var is None:
+        raise IndexError("No time variable found in NetCDF file")
+
     raw = var[:]
     units = getattr(var, "units", None)
+
+    # Если units нет у основной переменной — берём из 'time'
+    if units is None and "time" in ds.variables:
+        units = getattr(ds["time"], "units", None)
 
     # Случай 1: cftime-совместимые units
     if units:
