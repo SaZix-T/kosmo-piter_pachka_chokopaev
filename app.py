@@ -118,49 +118,6 @@ def register_routes(app: Flask) -> None:
         payload["calculation_id"] = uuid.uuid4().hex[:12]
         payload["algorithm_version"] = ALGO_VERSION
 
-        # orbit_tle: provide a TLE for ISS position estimation on UI
-        def _select_tle_current(env: dict) -> dict | None:
-            try:
-                items = (env or {}).get("items") or []
-                if not items:
-                    return None
-                x = items[0]
-                return {"line1": x.get("line1"), "line2": x.get("line2"), "epoch_utc": x.get("epoch_utc")}
-            except Exception:
-                return None
-
-        def _select_tle_historical(env: dict, ref_start_iso: str | None) -> dict | None:
-            try:
-                items = (env or {}).get("items") or []
-                if not items:
-                    return None
-                if not ref_start_iso:
-                    x = items[-1]
-                    return {"line1": x.get("line1"), "line2": x.get("line2"), "epoch_utc": x.get("epoch_utc")}
-                # choose last epoch <= ref_start
-                ref = parse_dt(ref_start_iso)
-                eligible = [i for i in items if i.get("epoch_utc") and parse_dt(i["epoch_utc"]) <= ref]
-                if not eligible:
-                    return None
-                eligible.sort(key=lambda i: parse_dt(i["epoch_utc"]))
-                x = eligible[-1]
-                return {"line1": x.get("line1"), "line2": x.get("line2"), "epoch_utc": x.get("epoch_utc")}
-            except Exception:
-                return None
-
-        orbit_tle = None
-        try:
-            mode = payload.get("mode")
-            rec = payload.get("recommendation") or {}
-            ref_start = rec.get("start") or (payload.get("windows") or [{}])[0].get("start")
-            if mode == "current":
-                orbit_tle = _select_tle_current(data.get("tle"))
-            else:
-                orbit_tle = _select_tle_historical(data.get("tle_history"), ref_start)
-        except Exception:
-            orbit_tle = None
-        payload["orbit_tle"] = orbit_tle
-
         app.calcs.set(payload["calculation_id"], payload, expire=CALC_TTL)
         return jsonify(payload)
 
