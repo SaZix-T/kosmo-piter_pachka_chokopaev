@@ -10,12 +10,23 @@ import diskcache
 from flask import Flask, jsonify, render_template, request, Response
 
 from metrics import analyze as metrics_analyze, ALGO_VERSION
-from timelines import iso_z, parse_dt
 
 import sources
 
 
 CALC_TTL = 7 * 24 * 3600
+
+def parse_dt(s) -> datetime:
+    """Парсит дату из формы."""
+    if s is None:
+        return None
+    if isinstance(s, datetime):
+        return s if s.tzinfo else s.replace(tzinfo=timezone.utc)
+    s = str(s).strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    d = datetime.fromisoformat(s)
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
 
 
 def create_app() -> Flask:
@@ -60,15 +71,7 @@ def register_routes(app: Flask) -> None:
     def sources_page():
         return render_template("sources.html")
 
-    # --- health ---
-
-    @app.get("/api/health")
-    def health():
-        return jsonify({
-            "status": "ok",
-            "algorithm_version": ALGO_VERSION,
-            "time_utc": _iso_z(_now()),
-        })
+    # health endpoint removed per requirements
 
     # --- analyze ---
 
@@ -114,6 +117,50 @@ def register_routes(app: Flask) -> None:
         payload = result.to_dict()
         payload["calculation_id"] = uuid.uuid4().hex[:12]
         payload["algorithm_version"] = ALGO_VERSION
+
+        # orbit_tle: provide a TLE for ISS position estimation on UI
+        def _select_tle_current(env: dict) -> dict | None:
+            try:
+                items = (env or {}).get("items") or []
+                if not items:
+                    return None
+                x = items[0]
+                return {"line1": x.get("line1"), "line2": x.get("line2"), "epoch_utc": x.get("epoch_utc")}
+            except Exception:
+                return None
+
+        def _select_tle_historical(env: dict, ref_start_iso: str | None) -> dict | None:
+            try:
+                items = (env or {}).get("items") or []
+                if not items:
+                    return None
+                if not ref_start_iso:
+                    x = items[-1]
+                    return {"line1": x.get("line1"), "line2": x.get("line2"), "epoch_utc": x.get("epoch_utc")}
+                # choose last epoch <= ref_start
+                ref = parse_dt(ref_start_iso)
+                eligible = [i for i in items if i.get("epoch_utc") and parse_dt(i["epoch_utc"]) <= ref]
+                if not eligible:
+                    return None
+                eligible.sort(key=lambda i: parse_dt(i["epoch_utc"]))
+                x = eligible[-1]
+                return {"line1": x.get("line1"), "line2": x.get("line2"), "epoch_utc": x.get("epoch_utc")}
+            except Exception:
+                return None
+
+        orbit_tle = None
+        try:
+            mode = payload.get("mode")
+            rec = payload.get("recommendation") or {}
+            ref_start = rec.get("start") or (payload.get("windows") or [{}])[0].get("start")
+            if mode == "current":
+                orbit_tle = _select_tle_current(data.get("tle"))
+            else:
+                orbit_tle = _select_tle_historical(data.get("tle_history"), ref_start)
+        except Exception:
+            orbit_tle = None
+        payload["orbit_tle"] = orbit_tle
+
         app.calcs.set(payload["calculation_id"], payload, expire=CALC_TTL)
         return jsonify(payload)
 

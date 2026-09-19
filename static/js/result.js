@@ -40,6 +40,99 @@
   const sourceLabel = (s) =>
     `<span class="text-secondary small">${s || "—"}</span>`;
 
+  // ---- Cesium / ISS map ----
+
+  let viewer = null;
+  let issEntity = null;
+  let orbitTle = null;
+
+  function initViewer() {
+    if (viewer || !window.Cesium) return;
+    try {
+      viewer = new Cesium.Viewer('iss-map', {
+        imageryProvider: new Cesium.UrlTemplateImageryProvider({
+          url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+          credit: '© OpenStreetMap contributors',
+          tilingScheme: new Cesium.WebMercatorTilingScheme(),
+          tileWidth: 256,
+          tileHeight: 256,
+          maximumLevel: 19,
+        }),
+        baseLayerPicker: false,
+        geocoder: false,
+        homeButton: false,
+        sceneModePicker: false,
+        navigationHelpButton: false,
+        animation: false,
+        timeline: false,
+        infoBox: false,
+        selectionIndicator: false,
+        shouldAnimate: false,
+        fullscreenButton: false,
+      });
+      viewer.scene.globe.enableLighting = true;
+      viewer.scene.skyAtmosphere.show = true;
+      // Free terrain provider (no Ion token)
+      try {
+        viewer.terrainProvider = new Cesium.CesiumTerrainProvider({
+          url: 'https://assets.agi.com/stk-terrain/world'
+        });
+      } catch (terrErr) {
+        // If terrain fails, fall back silently to ellipsoid terrain
+        viewer.terrainProvider = new Cesium.EllipsoidTerrainProvider();
+      }
+    } catch (e) {
+      const el = document.getElementById('iss-map');
+      if (el) {
+        el.innerHTML = `<div class="text-secondary">Ошибка инициализации карты: ${e.message}</div>`;
+      }
+    }
+  }
+
+  function computeIssLatLon(startIso, tle) {
+    if (!window.satellite || !tle || !tle.line1 || !tle.line2 || !startIso) return null;
+    try {
+      const satrec = satellite.twoline2satrec(tle.line1, tle.line2);
+      const date = new Date(startIso);
+      const pv = satellite.propagate(satrec, date);
+      if (!pv || !pv.position) return null;
+      const gmst = satellite.gstime(date);
+      const geo = satellite.eciToGeodetic(pv.position, gmst);
+      const lat = satellite.degreesLat(geo.latitude);
+      const lon = satellite.degreesLong(geo.longitude);
+      const heightMeters = Number.isFinite(geo.height) ? geo.height * 1000 : 420000;
+      return { lat, lon, heightMeters };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function updateIssMarker(lat, lon, heightMeters) {
+    if (!viewer || lat === undefined || lon === undefined) return;
+    const pos = Cesium.Cartesian3.fromDegrees(lon, lat, heightMeters || 0);
+    if (!issEntity) {
+      issEntity = viewer.entities.add({
+        position: pos,
+        point: { pixelSize: 8, color: Cesium.Color.CYAN, outlineColor: Cesium.Color.WHITE, outlineWidth: 1 },
+        label: { text: 'ISS', font: '12px sans-serif', fillColor: Cesium.Color.WHITE, showBackground: true, backgroundColor: Cesium.Color.BLACK.withAlpha(0.5), pixelOffset: new Cesium.Cartesian2(0, -20) },
+      });
+    } else {
+      issEntity.position = pos;
+    }
+    viewer.camera.flyTo({ destination: Cesium.Cartesian3.fromDegrees(lon, lat, 2000000) });
+  }
+
+  function updateIssForStart(startIso) {
+    // ensure viewer exists
+    if (!viewer) initViewer();
+    const p = computeIssLatLon(startIso, orbitTle);
+    if (!p) {
+      // no TLE or failed propagation — keep map as-is without overwriting
+      return;
+    }
+    updateIssMarker(p.lat, p.lon, p.heightMeters);
+  }
+
   // ---- блоки ----
 
   function renderHeader(data) {
@@ -79,13 +172,13 @@
           ${line.is_nd ? '' : levelBadge(line.level_lo, line.level_hi, false)}
           ${line.contributes ? '' : '<span class="badge bg-secondary">инфо</span>'}
         </div>
-        <div class="small text-secondary">${line.confidence}</div>
+        <div class="small">${line.confidence}</div>
       </div>`;
 
     const lim = line.limitations
-      ? `<div class="small text-secondary mb-2">${line.limitations}</div>` : "";
+      ? `<div class="small mb-2">${line.limitations}</div>` : "";
     const note = line.note
-      ? `<div class="small text-info mb-2">${line.note}</div>` : "";
+      ? `<div class="small mb-2">${line.note}</div>` : "";
 
     const segs = (line.segments || []).slice(0, 40).map(s => `
       <div class="d-flex justify-content-between small py-1 border-bottom border-secondary border-opacity-25">
@@ -110,7 +203,7 @@
 
   function renderWindows(data) {
     const rows = (data.windows || []).map(w => `
-      <tr>
+      <tr data-window-id="${w.id}" data-start="${w.start}">
         <td>#${w.id}</td>
         <td class="small">${isoShort(w.start)}<br>→ ${isoShort(w.end)}</td>
         <td>${levelBadge(w.peak_level_lo, w.peak_level_hi, false)}</td>
@@ -125,8 +218,19 @@
           <th>#</th><th>Интервал</th><th>Пик</th>
           <th>≥2 (мин)</th><th>Уверенность</th><th>Warnings</th>
         </tr></thead>
-        <tbody>${rows}</tbody>
+        <tbody id="windows-tbody">${rows}</tbody>
       </table>`;
+
+    // click handler to update ISS marker per window start
+    const tb = document.getElementById('windows-tbody');
+    if (tb) {
+      tb.addEventListener('click', (ev) => {
+        const tr = ev.target.closest('tr');
+        if (!tr) return;
+        const startIso = tr.getAttribute('data-start');
+        updateIssForStart(startIso);
+      });
+    }
   }
 
   function renderRecommendation(data) {
@@ -150,7 +254,7 @@
       </div>
       <div class="small mb-2">${isoShort(r.start)} → ${isoShort(r.end)}</div>
       <div class="mb-2"><span class="badge bg-info">${outcomeLabel}</span></div>
-      <div class="small text-secondary">${r.reason}</div>
+      <div class="small">${r.reason}</div>
       <div class="small mt-2">Уверенность: <strong>${r.confidence}</strong></div>`;
   }
 
@@ -229,6 +333,15 @@
       renderWarnings(data);
       renderInfo(data);
       renderSources(data);
+
+      // init map and set initial position
+      orbitTle = data.orbit_tle || null;
+      initViewer();
+      const rec = data.recommendation || {};
+      const startIso = rec.start || ((data.windows || [])[0] || {}).start;
+      if (startIso) {
+        updateIssForStart(startIso);
+      }
     })
     .catch(e => {
       root.innerHTML = `<div class="alert alert-danger">${e.message}</div>`;
