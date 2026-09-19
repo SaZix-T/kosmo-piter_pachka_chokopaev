@@ -757,7 +757,7 @@ DONKI_MAX_WINDOW_DAYS = 30
 
 
 def _donki_api_key() -> str:
-    return os.getenv("NASA_API_KEY", "lhyGGEeblDkRmjqsShnBLs8BTX5Q1CpNDJYAvZ4m")
+    return os.getenv("NASA_API_KEY", "DEMOKEY")
 
 
 def _donki_get(path: str, start: datetime, end: datetime,
