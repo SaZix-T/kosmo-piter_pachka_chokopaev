@@ -180,8 +180,8 @@ def _tle_epoch(line1: str) -> str:
 
 
 def _st_creds() -> Tuple[str, str]:
-    identity = os.getenv("SPACETRACK_USER") or os.getenv("SPACETRACK_IDENTITY")
-    password = os.getenv("SPACETRACK_PASSWORD")
+    identity = os.getenv("SPACETRACK_USER", "aefremova406@gmail.com")
+    password = os.getenv("SPACETRACK_PASSWORD", "qodny6-joptuN-xigcyd")
     if not (identity and password):
         raise RuntimeError("Space-Track: задайте SPACETRACK_USER и SPACETRACK_PASSWORD")
     return identity, password
@@ -757,7 +757,7 @@ DONKI_MAX_WINDOW_DAYS = 30
 
 
 def _donki_api_key() -> str:
-    return os.getenv("NASA_API_KEY", "lhyGGEeblDkRmjqsShnBLs8BTX5Q1CpNDJYAvZ4m")
+    return os.getenv("NASA_API_KEY", "DEMO_KEY")
 
 
 def _donki_get(path: str, start: datetime, end: datetime,

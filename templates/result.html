@@ -1,4 +1,6 @@
 {% extends "base.html" %}
+{% block title %}Результат — Прогнозирование рисков ВКД{% endblock %}
+
 {% block content %}
 <div class="container py-4" id="result-root" data-calc-id="{{ calc_id }}">
   <div class="d-flex justify-content-between align-items-center mb-3">
@@ -12,44 +14,89 @@
   <div class="glass p-3 mb-3" id="header-block"></div>
 
   <div class="row g-3">
+    <!-- ЛЕВАЯ КОЛОНКА -->
     <div class="col-lg-7">
       <div class="glass p-3 mb-3">
-        <h5 class="text-light">Линии анализа</h5>
+        <h5 class="text-light mb-3">Линии анализа</h5>
         <div id="lines-block"></div>
       </div>
 
       <div class="glass p-3 mb-3">
-        <h5 class="text-light">Окна-кандидаты</h5>
+        <h5 class="text-light mb-3">Окна-кандидаты</h5>
         <div id="windows-block"></div>
       </div>
+
+      <div class="glass p-3 mb-3">
+        <h5 class="text-light mb-3">Предупреждения</h5>
+        <div id="warnings-block"></div>
+      </div>
+
+      <!-- Глобус идёт в левой колонке, заполняет пустоту -->
+      <section class="glass p-3 mb-3">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <h5 class="text-light mb-0">
+            <i class="bi bi-globe2 me-2"></i>Траектория МКС
+          </h5>
+          <span class="badge bg-secondary" id="globe-badge">—</span>
+        </div>
+
+        <div id="globe-container" class="globe-wrap">
+          <div id="globe"></div>
+          <div id="globe-loading" class="globe-loading">
+            <div class="spinner-glass"></div>
+            <span>Считаю траекторию…</span>
+          </div>
+          <div id="globe-error" class="globe-error" hidden></div>
+        </div>
+
+        <div class="small text-secondary mt-2" id="globe-info">—</div>
+      </section>
     </div>
 
+    <!-- ПРАВАЯ КОЛОНКА -->
     <div class="col-lg-5">
       <div class="glass p-3 mb-3">
-        <h5 class="text-light">Рекомендация</h5>
+        <h5 class="text-light mb-3">Рекомендация</h5>
         <div id="recommendation-block"></div>
       </div>
 
       <div class="glass p-3 mb-3">
-        <h5 class="text-light">Предупреждения</h5>
-        <div id="warnings-block"></div>
-      </div>
-
-      <div class="glass p-3 mb-3">
-        <h5 class="text-light">Информационные карточки</h5>
+        <h5 class="text-light mb-3">Информационные карточки</h5>
         <div id="info-block"></div>
       </div>
 
       <div class="glass p-3 mb-3">
-        <h5 class="text-light">Источники</h5>
+        <h5 class="text-light mb-3">Источники</h5>
         <div id="sources-block"></div>
+      </div>
+
+      <div class="glass p-3 mb-3">
+        <h5 class="text-light mb-3">
+          <i class="bi bi-download me-2"></i>Экспорт
+        </h5>
+        <div class="d-flex gap-2 mb-3">
+          <a class="btn btn-outline-light" id="export-json">
+            <i class="bi bi-filetype-json me-1"></i> JSON
+          </a>
+          <a class="btn btn-outline-light" id="export-csv">
+            <i class="bi bi-filetype-csv me-1"></i> CSV
+          </a>
+        </div>
+        <div class="small text-secondary mt-3">
+          <strong>Легенда:</strong>
+          <div class="mt-1">
+            <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#a5f3fc;vertical-align:middle;margin-right:6px"></span>
+            текущее положение МКС
+          </div>
+          <div>
+            <span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:rgba(168,85,247,0.9);vertical-align:middle;margin-right:6px"></span>
+            конец окна
+          </div>
+        </div>
       </div>
     </div>
   </div>
-  <div class="d-flex gap-2 mt-3">
-    <a class="btn btn-outline-light" id="export-json">Скачать JSON</a>
-    <a class="btn btn-outline-light" id="export-csv">Скачать CSV</a>
-  </div>
 </div>
+
 <script src="{{ url_for('static', filename='js/result.js') }}"></script>
 {% endblock %}

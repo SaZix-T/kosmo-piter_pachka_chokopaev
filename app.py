@@ -12,6 +12,7 @@ from flask import Flask, jsonify, render_template, request, Response
 from metrics import analyze as metrics_analyze, ALGO_VERSION
 
 import sources
+import orbit 
 
 
 CALC_TTL = 7 * 24 * 3600
@@ -129,68 +130,71 @@ def register_routes(app: Flask) -> None:
 
     # --- get / list / export ---
 
-    @app.get("/api/iss-track/<calc_id>")
-    def iss_track(calc_id: str):
+    @app.get("/api/iss/track")
+    def iss_track():
+        """Возвращает траекторию МКС за период расчёта.
+
+        ?calc_id=<id>  — обязательно
+        """
+        calc_id = request.args.get("calc_id")
+        if not calc_id:
+            return jsonify({"error": "нужен параметр calc_id"}), 400
+
         row = app.calcs.get(calc_id)
         if not row:
-            return jsonify({"error": "Расчёт не найден"}), 404
-
-        # TLE: из sources_status.tle или tle_history
-        tle_env = row.get("sources_status", {}).get("tle") or \
-                row.get("sources_status", {}).get("tle_history")
-        if not tle_env:
-            return jsonify({"error": "TLE не найден в расчёте"}), 400
-
-        # Достаём TLE из envelope → items[0]
-        # sources_status не хранит items. Поэтому пойдём в кэш через sources.
-        import sources
-        tle_items = None
-        try:
-            env = sources.fetch_tle_iss()
-            tle_items = env.get("items") or []
-        except Exception:
-            pass
-
-        if not tle_items:
-            # fallback: пробуем исторический
-            env = sources.fetch_tle_history(
-                parse_dt(row["start"]),
-                parse_dt(row["end"]),
-            )
-            tle_items = env.get("items") or []
-
-        if not tle_items:
-            return jsonify({"error": "TLE недоступен для расчёта"}), 503
-
-        item = tle_items[0]
-        line1 = item.get("line1")
-        line2 = item.get("line2")
-
-        if not (line1 and line2):
-            return jsonify({"error": "TLE без line1/line2"}), 500
-
-        from orbit import iss_position, iss_track
-
-        start = parse_dt(row["start"])
-        end = parse_dt(row["end"])
-        rec = row.get("recommendation") or {}
-        focus_iso = rec.get("start") or row["start"]
-        focus = parse_dt(focus_iso)
+            return jsonify({"error": "расчёт не найден"}), 404
 
         try:
-            position = iss_position(line1, line2, focus)
-            track = iss_track(line1, line2, start, end, step_seconds=90)
+            start = parse_dt(row["start"])
+            end = parse_dt(row["end"])
         except Exception as e:
-            return jsonify({"error": f"Ошибка расчёта орбиты: {e}"}), 500
+            return jsonify({"error": f"некорректные даты: {e}"}), 500
+
+        # TLE: для historical — из архива, для current — свежий
+        if row.get("mode") == "historical":
+            tle_env = sources.fetch_tle_history(
+                start, end, cutoff=datetime.now(timezone.utc))
+        else:
+            tle_env = sources.fetch_tle_iss()
+
+        if tle_env.get("error") or not tle_env.get("items"):
+            return jsonify({
+                "error": "TLE недоступен",
+                "details": tle_env.get("error"),
+            }), 503
+
+        # В historical — последний доступный на момент отсечки,
+        # в current — единственный свежий
+        tle = tle_env["items"][-1] if row.get("mode") == "historical" \
+            else tle_env["items"][0]
+
+        if not (tle.get("line1") and tle.get("line2")):
+            return jsonify({"error": "TLE неполный"}), 503
+
+        win_start = parse_dt(row["start"])
+        win_end = parse_dt(row["end"])
+        dur_min = max(1.0, (win_end - win_start).total_seconds() / 60.0)
+        step = max(2, min(10, int(dur_min / 80) or 2))
+
+        points = orbit.track(
+            tle["line1"], tle["line2"],
+            win_start, win_end,
+            step_minutes=step, max_points=250,
+        )
 
         return jsonify({
-            "tle_epoch": item.get("epoch_utc"),
-            "tle_source": tle_env.get("source"),
-            "focus": position,
-            "track": track,
-            "focus_window": {
-                "start": row["start"], "end": row["end"],
+            "iss": {
+                "name": tle.get("name"),
+                "epoch_utc": tle.get("epoch_utc"),
+                "creation_date": tle.get("creation_date"),
             },
+            "mode": row.get("mode"),
+            "start": row["start"],
+            "end": row["end"],
+            "points": points,
+            "source": tle_env.get("source"),
+            "source_url": tle_env.get("source_url"),
+            "limitations": tle_env.get("limitations"),
         })
 
     # ---

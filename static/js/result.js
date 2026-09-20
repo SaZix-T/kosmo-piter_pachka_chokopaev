@@ -116,25 +116,37 @@
   }
 
   function renderWindows(data) {
-    const rows = (data.windows || []).map(w => `
-      <tr>
-        <td>#${w.id}</td>
-        <td class="small">${isoShort(w.start)}<br>→ ${isoShort(w.end)}</td>
-        <td>${levelBadge(w.peak_level_lo, w.peak_level_hi, false, w.peak_level_label)}</td>
-        <td>${w.minutes_at_warning} мин</td>
-        <td class="small text-secondary">${w.confidence_label || w.confidence}</td>
-        <td>${(w.warnings || []).length}</td>
-      </tr>`).join("");
+  const rows = (data.windows || []).map(w => `
+    <tr>
+      <td>#${w.id}</td>
+      <td class="small">
+        ${isoShort(w.start)}<br>
+        <span class="text-secondary">→ ${isoShort(w.end)}</span>
+      </td>
+      <td>${levelBadge(w.peak_level_lo, w.peak_level_hi, false, w.peak_level_label)}</td>
+      <td class="text-center">${w.minutes_at_warning}</td>
+      <td class="small text-secondary">${w.confidence_label || w.confidence}</td>
+      <td class="text-center">${(w.warnings || []).length}</td>
+    </tr>`).join("");
 
-    $("windows-block").innerHTML = `
+  $("windows-block").innerHTML = `
+    <div class="table-wrap">
       <table class="table table-dark table-sm table-borderless align-middle mb-0">
         <thead><tr>
-          <th>#</th><th>Интервал</th><th>Пик риска</th>
-          <th>Мин. на уровне 2+</th><th>Уверенность</th><th>Оповещений</th>
+          <th>#</th>
+          <th>Интервал</th>
+          <th>Пик риска</th>
+          <th class="text-center">Мин ≥ 2</th>
+          <th>Уверенность</th>
+          <th class="text-center">Оповещ.</th>
         </tr></thead>
         <tbody>${rows}</tbody>
-      </table>`;
-  }
+      </table>
+    </div>
+    <div class="small text-secondary mt-2 d-md-none">
+      ← таблицу можно прокручивать →
+    </div>`;
+}
 
   function renderRecommendation(data) {
     const r = data.recommendation;
@@ -219,36 +231,40 @@
   }
 
   function renderSources(data) {
-    const rows = Object.entries(data.sources_status || {}).map(([k, s]) => {
-      const statusIcon = s.error
-        ? `<span class="text-danger" title="${s.error}">✗</span>`
-        : s.items_count > 0
-          ? `<span class="text-success">✓</span>`
-          : `<span class="text-warning" title="Источник ответил, но данных нет">○</span>`;
+  const rows = Object.entries(data.sources_status || {}).map(([k, s]) => {
+    const status = s.error
+      ? `<span class="text-danger" title="${s.error}">✗</span>`
+      : s.items_count > 0
+        ? `<span class="text-success">✓</span>`
+        : `<span class="text-warning" title="Источник ответил, но записей нет">○</span>`;
 
-      return `
-        <tr>
-          <td class="small"><code>${k}</code></td>
-          <td class="small">${s.source || "—"}</td>
-          <td class="small text-end">${s.items_count}</td>
-          <td class="small text-secondary">${s.mode === "historical" ? "истор." : "тек."}</td>
-          <td class="small text-center">${statusIcon}</td>
-        </tr>`;
-    }).join("");
+    return `
+      <tr>
+        <td class="small"><code>${k}</code></td>
+        <td class="small">${s.source || "—"}</td>
+        <td class="small text-end">${s.items_count}</td>
+        <td class="small text-secondary">${s.mode === "historical" ? "истор." : "тек."}</td>
+        <td class="small text-center">${status}</td>
+      </tr>`;
+  }).join("");
 
-    $("sources-block").innerHTML = `
+  $("sources-block").innerHTML = `
+    <div class="table-wrap">
       <table class="table table-dark table-sm table-borderless mb-0">
         <thead><tr>
-          <th>Ключ</th><th>Источник</th>
+          <th>Ключ</th>
+          <th>Источник</th>
           <th class="text-end">Записей</th>
-          <th>Режим</th><th class="text-center">Статус</th>
+          <th>Режим</th>
+          <th class="text-center">Статус</th>
         </tr></thead>
         <tbody>${rows}</tbody>
       </table>
-      <div class="small text-secondary mt-2">
-        ✓ — данные получены · ○ — источник ответил, но записей нет · ✗ — ошибка (наведите для деталей)
-      </div>`;
-  }
+    </div>
+    <div class="small text-secondary mt-2">
+      ✓ — данные получены · ○ — источник ответил, но записей нет · ✗ — ошибка
+    </div>`;
+}
 
   fetch(`/api/analyze/${calcId}`)
     .then(r => r.json())
@@ -261,6 +277,7 @@
       renderWarnings(data);
       renderInfo(data);
       renderSources(data);
+      renderGlobe(data);  // ← добавить
     })
     .catch(e => {
       root.innerHTML = `<div class="alert alert-danger">
@@ -278,110 +295,208 @@
     // ---------------------------------------------------------
   // 3D-глобус МКС
   // ---------------------------------------------------------
-  function renderIssGlobe() {
-    const container = document.getElementById("iss-globe");
-    if (!container || typeof Globe === "undefined") return;
+  // ---- 3D-карта МКС ----
 
-    fetch(`/api/iss-track/${calcId}`)
-      .then(r => r.json())
-      .then(data => {
-        if (data.error) {
-          container.innerHTML =
-            `<div class="text-secondary small p-3">Карта недоступна: ${data.error}</div>`;
-          return;
-        }
+let _globe = null;
+let _globeScriptLoaded = false;
 
-        const focus = data.focus;
-        const track = (data.track || []).map(p => ({
-          lat: p.lat, lng: p.lon, alt: p.alt_km / 6371,  // нормируем на радиус Земли
-        }));
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    if (document.querySelector(`script[src="${src}"]`)) return resolve();
+    const s = document.createElement("script");
+    s.src = src;
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error("CDN недоступен"));
+    document.head.appendChild(s);
+  });
+}async function renderGlobe(data) {
+  const host = document.getElementById("globe");
+  if (!host) return;
 
-        const globe = Globe()
-          .globeImageUrl("//unpkg.com/three-globe/example/img/earth-night.jpg")
-          .bumpImageUrl("//unpkg.com/three-globe/example/img/earth-topology.png")
-          .backgroundImageUrl("//unpkg.com/three-globe/example/img/night-sky.png")
-          .atmosphereColor("#22d3ee")
-          .atmosphereAltitude(0.18)
-          (container);
+  const loading = document.getElementById("globe-loading");
+  const errorBox = document.getElementById("globe-error");
+  const info = document.getElementById("globe-info");
+  const badge = document.getElementById("globe-badge");
 
-        // Настройка камеры: смотрим на МКС
-        globe.pointOfView({ lat: focus.lat -15, lng: focus.lon, altitude: 2.2 }, 0);
+  try {
+    if (!_globeScriptLoaded) {
+      await loadScript("https://unpkg.com/globe.gl@2.32.4/dist/globe.gl.min.js");
+      _globeScriptLoaded = true;
+    }
+    if (!window.Globe) throw new Error("Globe.gl не загрузился");
 
-        // Трек МКС — анимированный пунктир
-        globe
-          .pathsData([{ points: track, color: "#22d3ee" }])
-          .pathPoints("points")
-          .pathPointLat(p => p.lat)
-          .pathPointLng(p => p.lng)
-          .pathPointAlt(p => p.alt)
-          .pathColor("color")
-          .pathStroke(1.5)
-          .pathDashLength(0.35)
-          .pathDashGap(0.25)
-          .pathDashAnimateTime(6000)
-          .pathTransitionDuration(0);
+    const r = await fetch(`/api/iss/track?calc_id=${encodeURIComponent(calcId)}`);
+    const track = await r.json();
 
-        // Точка МКС
-        globe
-          .pointsData([{ lat: focus.lat, lng: focus.lon, alt: focus.alt_km / 6371 }])
-          .pointLat("lat")
-          .pointLng("lng")
-          .pointAltitude("alt")
-          .pointRadius(0.35)
-          .pointColor(() => "#facc15");
+    if (!r.ok || !track.points || !track.points.length) {
+      throw new Error(track.error || "нет данных траектории");
+    }
 
-        // Кольцо вокруг МКС (пульсирует)
-        globe.ringsData([{ lat: focus.lat, lng: focus.lon }])
-          .ringLat("lat")
-          .ringLng("lng")
-          .ringColor(() => t => `rgba(250, 204, 21, ${1 - t})`)
-          .ringMaxRadius(4)
-          .ringPropagationSpeed(3)
-          .ringRepeatPeriod(1200);
+    await new Promise(res => requestAnimationFrame(res));
+    await new Promise(res => requestAnimationFrame(res));
 
-        // Медленное авто-вращение + перехват мыши
-        const controls = globe.controls();
-        controls.autoRotate = true;
-        controls.enableZoom = true;
-        controls.enablePan = true;
+    const W = host.clientWidth || 800;
+    const H = host.clientHeight || 460;
 
-        document.getElementById("iss-meta").textContent =
-          `${focus.lat.toFixed(2)}°, ${focus.lon.toFixed(2)}° · ${focus.alt_km.toFixed(0)} км`;
+    // ---- Определяем окно, для которого рисуем ----
+    // Приоритет: recommendation.window_id → первое окно → всё.
+    let winStart = null, winEnd = null, winLabel = "всё окно поиска";
+    const recId = data.recommendation?.window_id;
+    const allWins = data.windows || [];
 
-        document.getElementById("iss-caption").innerHTML =
-          `TLE: ${data.tle_source || "—"} · ` +
-          `момент: ${isoShort(focus.time)} · ` +
-          `точек трека: ${data.track.length}`;
+    if (recId != null) {
+      const w = allWins.find(x => x.id === recId);
+      if (w) {
+        winStart = new Date(w.start).getTime();
+        winEnd = new Date(w.end).getTime();
+        winLabel = `окно #${w.id}`;
+      }
+    }
+    if (winStart === null && allWins.length) {
+      const w = allWins[0];
+      winStart = new Date(w.start).getTime();
+      winEnd = new Date(w.end).getTime();
+      winLabel = `окно #${w.id}`;
+    }
 
-        // Ресайз
-        window.addEventListener("resize", () => {
-          globe.width(container.clientWidth);
-          globe.height(container.clientHeight);
-        });
-      })
-      .catch(e => {
-        container.innerHTML =
-          `<div class="text-secondary small p-3">Ошибка загрузки карты: ${e.message}</div>`;
+    // ---- Фильтр точек по окну ----
+    let points = track.points;
+    if (winStart !== null && winEnd !== null) {
+      const filtered = track.points.filter(p => {
+        const t = new Date(p.t).getTime();
+        return t >= winStart && t <= winEnd;
       });
+      if (filtered.length >= 2) points = filtered;
+    }
+
+    console.log("[globe] window:", winLabel,
+                "points in window:", points.length,
+                "of", track.points.length);
+
+    loading.hidden = true;
+
+    if (_globe) {
+      host.innerHTML = "";
+      _globe = null;
+    }
+
+    const g = Globe()(host)
+      .width(W)
+      .height(H)
+      .globeImageUrl("//unpkg.com/three-globe/example/img/earth-night.jpg")
+      .backgroundColor("rgba(0,0,0,0)")
+      .showAtmosphere(true)
+      .atmosphereColor("#7dd3fc")
+      .atmosphereAltitude(0.18);
+
+    g.pointOfView({ lat: 20, lng: 0, altitude: 2.3 }, 0);
+
+    const first = points[0];
+    const last = points[points.length - 1];
+
+  // arcsData рисует great-circle дуги и корректно проходит антимеридиан.
+  // Пропускаем только полностью совпадающие точки (что маловероятно).
+  const arcs = [];
+  for (let i = 0; i < points.length - 1; i++) {
+    const a = points[i], b = points[i + 1];
+    if (Math.abs(a.lat - b.lat) < 1e-6 && Math.abs(a.lon - b.lon) < 1e-6) {
+      continue;
+    }
+    arcs.push({
+      startLat: a.lat, startLng: a.lon,
+      endLat:   b.lat, endLng:   b.lon,
+    });
   }
 
-  // Вызов в цепочке рендера результата
-  fetch(`/api/analyze/${calcId}`)
-    .then(r => r.json())
-    .then(data => {
-      if (data.error) throw new Error(data.error);
-      renderHeader(data);
-      renderLines(data);
-      renderWindows(data);
-      renderRecommendation(data);
-      renderWarnings(data);
-      renderInfo(data);
-      renderSources(data);
-      renderIssGlobe();   // ← добавили
-    })
-    .catch(e => {
-      root.innerHTML = `<div class="alert alert-danger">
-        Не удалось загрузить расчёт: ${e.message}
-      </div>`;
+    g.arcsData(arcs)
+      .arcStartLat("startLat")
+      .arcStartLng("startLng")
+      .arcEndLat("endLat")
+      .arcEndLng("endLng")
+      .arcColor(() => "rgba(34, 211, 238, 0.95)")
+      .arcStroke(0.5)
+      .arcAltitude(0.02)
+      .arcAltitudeAutoScale(0)
+      .arcDashLength(1)
+      .arcDashGap(0)
+      .arcDashAnimateTime(0)
+      .arcsTransitionDuration(0);
+
+    // ---- Маркеры начала, конца и МКС ----
+    g.pointsData([
+      { lat: first.lat, lng: first.lon,
+        color: "rgba(148, 163, 184, 0.9)", radius: 0.25,
+        altitude: 0.015, label: "Начало окна" },
+      { lat: last.lat, lng: last.lon,
+        color: "rgba(168, 85, 247, 0.9)", radius: 0.25,
+        altitude: 0.015, label: "Конец окна" },
+      { lat: first.lat, lng: first.lon,
+        color: "#a5f3fc", radius: 0.35,
+        altitude: 0.025, label: "МКС" },
+    ])
+      .pointLat("lat")
+      .pointLng("lng")
+      .pointAltitude("altitude")
+      .pointRadius("radius")
+      .pointColor("color")
+      .pointLabel("label")
+      .pointResolution(16)
+      .pointsMerge(false);
+
+    g.ringsData([{ lat: first.lat, lng: first.lon }])
+      .ringLat("lat")
+      .ringLng("lng")
+      .ringColor(() => (t) => `rgba(165, 243, 252, ${1 - t})`)
+      .ringMaxRadius(2.4)
+      .ringPropagationSpeed(2.8)
+      .ringRepeatPeriod(1500);
+
+    const controls = g.controls();
+    controls.autoRotate = true;
+    controls.autoRotateSpeed = 0.4;
+    controls.enableZoom = true;
+    controls.enablePan = false;
+    controls.enableDamping = true;
+    controls.minDistance = 200;
+    controls.maxDistance = 800;
+    controls.addEventListener("start", () => { controls.autoRotate = false; });
+    controls.addEventListener("end", () => {
+      setTimeout(() => { controls.autoRotate = true; }, 4000);
     });
+
+    const onResize = () => {
+      if (!_globe) return;
+      const w = host.clientWidth, h = host.clientHeight;
+      if (w && h) { _globe.width(w); _globe.height(h); }
+    };
+    window.addEventListener("resize", onResize);
+
+    _globe = g;
+
+    if (badge) {
+      badge.textContent = track.mode === "historical" ? "Исторический TLE" : "Свежий TLE";
+      badge.className = "badge " + (
+        track.mode === "historical" ? "bg-warning text-dark" : "bg-success"
+      );
+    }
+
+    if (info) {
+      const durMin = points.length > 1
+        ? Math.round((new Date(last.t) - new Date(first.t)) / 60000)
+        : 0;
+      info.innerHTML =
+        `Траектория за ${winLabel}: ${points.length} точек · ${durMin} мин · ` +
+        `${isoShort(first.t)} → ${isoShort(last.t)}` +
+        (track.iss?.epoch_utc ? ` · эпоха TLE: ${isoShort(track.iss.epoch_utc)}` : "") +
+        (track.source ? ` · источник: ${track.source}` : "");
+    }
+  } catch (err) {
+    console.error("[globe]", err);
+    if (loading) loading.hidden = true;
+    if (errorBox) {
+      errorBox.hidden = false;
+      errorBox.textContent = "Карта недоступна: " + err.message;
+    }
+  }
+}
 })();

@@ -1,20 +1,20 @@
 {% extends "base.html" %}
-{% block title %}Источники — Прогнозирование рисков ВКД{% endblock %}
-
 {% block content %}
-<section class="glass glass-section reveal">
+<div class="container py-4" id="sources-root">
   <div class="d-flex justify-content-between align-items-center mb-3">
-    <h3 class="glass-title"><i class="bi bi-hdd-network me-2"></i>Состояние источников</h3>
-    <button class="btn-glass" id="refreshSourcesBtn">
-      <i class="bi bi-arrow-clockwise"></i> Обновить
-    </button>
-  </div>
-
-  <div id="sourcesTableWrap">
-    <div class="empty-state">
-      <i class="bi bi-hourglass-split"></i>
-      Загрузка…
+    <h2 class="text-light mb-0">Источники</h2>
+    <div class="text-end small" id="meta-block">
+      <!-- meta info will be injected by JS -->
     </div>
   </div>
-</section>
+
+  <div id="alert-block"></div>
+
+  <div class="glass p-3">
+    <div id="table-block">
+      <div class="text-secondary">Загрузка…</div>
+    </div>
+  </div>
+</div>
+<script src="{{ url_for('static', filename='js/sources.js') }}"></script>
 {% endblock %}
